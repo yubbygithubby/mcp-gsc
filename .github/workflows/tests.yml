@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GSC_SKIP_OAUTH: "true"
-      GSC_CONFIG_DIR: ${{ runner.temp }}/mcp-gsc-test-config
+      GSC_CONFIG_DIR: ${{ github.workspace }}/.test-config
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

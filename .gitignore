@@ -39,6 +39,7 @@ desktop.ini
 .coverage.*
 htmlcov/
 .pytest_cache/
+.test-config/
 .tox/
 nosetests.xml
 coverage.xml
