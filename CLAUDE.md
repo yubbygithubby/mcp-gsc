@@ -27,24 +27,25 @@ Set `GSC_SKIP_OAUTH=true` to force service account mode and skip OAuth entirely.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Set to `sse` for remote/Docker/network use |
-| `MCP_HOST` | `127.0.0.1` | Host to bind when `MCP_TRANSPORT=sse` |
-| `MCP_PORT` | `3001` | Port to bind when `MCP_TRANSPORT=sse` |
+| `MCP_TRANSPORT` | `stdio` | Set to `streamable-http` for `/mcp` over HTTP (`http` is an alias) |
+| `MCP_HOST` | `127.0.0.1` | Host to bind when `MCP_TRANSPORT=streamable-http` |
+| `MCP_PORT` | `3001` | Port to bind when `MCP_TRANSPORT=streamable-http` |
 | `GSC_DATA_STATE` | `all` | `all` = matches GSC dashboard; `final` = confirmed data only (2–3 day lag) |
-| `GSC_ALLOW_DESTRUCTIVE` | `false` | Set `true` to enable `add_site`, `delete_site`, `delete_sitemap` |
+| `MCP_ALLOWED_HOSTS` | loopback hosts | Comma-separated Host allowlist |
+| `MCP_ALLOWED_ORIGINS` | loopback origins | Comma-separated Origin allowlist |
 | `GSC_CREDENTIALS_PATH` | — | Path to service account JSON key file |
 | `GSC_OAUTH_CLIENT_SECRETS_FILE` | `client_secrets.json` | Path to OAuth client secrets file |
 | `GSC_SKIP_OAUTH` | `false` | Set `true` to skip OAuth and use service account only |
 
 ## Adding a new tool
 
-1. Add an `@mcp.tool()` decorated async function anywhere in `gsc_server.py`
+1. Add an async function with `@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))`. Only read-only tools belong in this fork.
 2. Use `get_gsc_service()` for auth — it handles OAuth and service account automatically
 3. Return `json.dumps(result)` not formatted text strings (LLMs work better with structured data)
 4. Handle `HttpError` and return a plain string error message on failure
 
 ```python
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
 async def my_new_tool(site_url: str) -> str:
     """One-line description shown to the AI as the tool's purpose."""
     try:
@@ -60,7 +61,8 @@ async def my_new_tool(site_url: str) -> str:
 ## Running tests
 
 ```bash
-pytest test_gsc_server.py -v
+uv sync --frozen --group dev
+uv run --frozen pytest -q
 ```
 
 No credentials needed — all Google API calls are mocked with `unittest.mock`.
@@ -69,7 +71,11 @@ No credentials needed — all Google API calls are mocked with `unittest.mock`.
 
 ```bash
 docker build -t mcp-gsc .
-docker run -e MCP_TRANSPORT=sse -e MCP_PORT=3001 \
+docker run -e MCP_TRANSPORT=streamable-http -e MCP_HOST=0.0.0.0 -e MCP_PORT=3001 \
   -v /path/to/client_secrets.json:/app/client_secrets.json \
-  -p 3001:3001 mcp-gsc
+  -p 127.0.0.1:3001:3001 mcp-gsc
 ```
+
+## Fork constraints
+
+GSC scope is `webmasters.readonly`. Write tools have been removed and `manage_sitemaps` only accepts `list`/`details`. Reauthentication is a local CLI command (`python gsc_server.py --reauthenticate`), never an MCP tool. HTTP cannot initiate browser login. The HTTP transport is stateless with JSON responses at `/mcp`; legacy SSE is unsupported. Keep Host/Origin checks enabled. Per-user Google connections and MCP authentication are not implemented; keep the server private until those later steps are complete.

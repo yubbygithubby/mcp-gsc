@@ -24,7 +24,7 @@ def _load_module(env_overrides: dict | None = None):
     env = {
         "GSC_SKIP_OAUTH": "true",          # prevent live OAuth attempts by default
         "GSC_DATA_STATE": "all",
-        "GSC_ALLOW_DESTRUCTIVE": "false",
+        "MCP_TRANSPORT": "stdio",
         **(env_overrides or {}),
     }
     with patch.dict(os.environ, env, clear=False):
@@ -886,52 +886,6 @@ class TestGetSitemapDetails(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["type"], "Sitemap")
         self.assertEqual(data["status"], "processed")
         self.assertEqual(data["content_breakdown"][0]["submitted"], 500)
-
-
-# ---------------------------------------------------------------------------
-# TestSafetyGuards
-# ---------------------------------------------------------------------------
-
-class TestSafetyGuards(unittest.IsolatedAsyncioTestCase):
-
-    async def test_add_site_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.add_site("https://newsite.com/")
-        self.assertIn("Safety", result)
-
-    async def test_delete_site_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.delete_site("https://newsite.com/")
-        self.assertIn("Safety", result)
-
-    async def test_delete_sitemap_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.delete_sitemap("https://example.com/", "https://example.com/sitemap.xml")
-        self.assertIn("Safety", result)
-
-    async def test_add_site_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sites().add().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.add_site("https://newsite.com/")
-        self.assertNotIn("Safety", result)
-
-    async def test_delete_site_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sites().delete().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.delete_site("https://example.com/")
-        self.assertNotIn("Safety", result)
-
-    async def test_delete_sitemap_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sitemaps().delete().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.delete_sitemap("https://example.com/", "https://example.com/sitemap.xml")
-        self.assertNotIn("Safety", result)
 
 
 # ---------------------------------------------------------------------------

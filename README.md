@@ -7,6 +7,29 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ---
 
+## Cowork transport adaptation (this fork)
+
+This fork implements step 1 of the Cowork integration: **Streamable HTTP at `/mcp`** and a **read-only GSC tool surface**. Local stdio clients still work.
+
+- Remote mode: `MCP_TRANSPORT=streamable-http` (`http` is an alias). Legacy `sse` is rejected.
+- GSC scope: `https://www.googleapis.com/auth/webmasters.readonly`.
+- Property creation/removal and sitemap submission/removal have been removed. `GSC_ALLOW_DESTRUCTIVE` has no effect.
+- `reauthenticate` is a local command, never a remote tool. HTTP requests never launch Google login.
+- This is a local development foundation. It still uses one server-side Google credential store. Per-user Google connections, MCP OAuth/token validation, production hosting and the Cowork plugin are later steps. **Do not expose this endpoint publicly before adding authentication and user isolation.**
+
+Install this fork from source (the public PyPI package still contains the upstream server):
+
+```bash
+git clone https://github.com/yubbygithubby/mcp-gsc.git
+cd mcp-gsc
+git checkout codex/streamable-http-readonly
+uv sync --frozen
+```
+
+For local Google OAuth testing, configure a Desktop OAuth client with the existing upstream setup below, then run `uv run python gsc_server.py --reauthenticate`. Use a fresh `GSC_CONFIG_DIR` or reconnect to replace any previously granted full-access token. Changing the requested scope does not revoke an existing Google grant. A Web application client and per-user token storage will be added with the later account-connection work.
+
+For a local stdio client, use `uv run --directory /absolute/path/to/mcp-gsc python gsc_server.py`. The upstream PyPI and marketplace installation examples below do not install this fork.
+
 ## What's New
 
 ### [0.4.1] — September 2026
@@ -36,7 +59,6 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 **Property Management**
 - See all your GSC properties in one place
 - Get verification details and ownership information
-- Add or remove properties from your account
 
 **Search Analytics & Reporting**
 - Discover which queries bring visitors to your site
@@ -51,7 +73,6 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 **Sitemap Management**
 - View all sitemaps and their status
-- Submit new sitemaps
 - Check for errors or warnings
 
 ---
@@ -73,10 +94,11 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 | `check_indexing_issues` | Check multiple URLs for indexing problems | Site URL, list of URLs |
 | `get_sitemaps` | Lists all sitemaps for a site | Site URL |
 | `list_sitemaps_enhanced` | Detailed sitemap info including errors and warnings | Site URL |
-| `manage_sitemaps` | Submit or delete sitemaps | Site URL, action |
-| `reauthenticate` | Re-run the OAuth browser login (switch accounts) | Nothing |
+| `get_sitemap_details` | Read details for a sitemap | Site URL, sitemap URL |
+| `manage_sitemaps` | Read sitemap lists or details | Site URL, read action |
+| `get_creator_info` | Information about the upstream creator | Nothing |
 
-*Ask your AI assistant to "call get_capabilities" for the full list of all 20 tools.*
+*Ask your AI assistant to "call get_capabilities" for the full list of all 16 read-only tools.*
 
 ---
 
@@ -330,7 +352,6 @@ If you see your properties — it's working. If not, ask: **"Call get_capabiliti
 | `GSC_CREDENTIALS_PATH` | Service account only | — | Absolute path to your service account JSON key. Always required when using `uvx`. |
 | `GSC_SKIP_OAUTH` | No | `false` | Set to `"true"` to force service account auth and skip OAuth entirely |
 | `GSC_DATA_STATE` | No | `"all"` | `"all"` matches the GSC dashboard. `"final"` returns only confirmed data (2–3 day lag). |
-| `GSC_ALLOW_DESTRUCTIVE` | No | `false` | Set to `"true"` to enable add/delete site and delete sitemap tools |
 
 ---
 
@@ -417,46 +438,60 @@ The MCP server runs locally on your machine. It only works in the **Claude Deskt
 
 ---
 
-## Safety: Destructive Operations
+## Read-only behavior
 
-By default, `add_site`, `delete_site`, and `delete_sitemap` are disabled. To enable them:
+All 16 MCP tools declare `readOnlyHint=true` and `destructiveHint=false`. Search Console writes are absent from discovery and cannot be invoked through `tools/call`, even with `GSC_ALLOW_DESTRUCTIVE=true`. `manage_sitemaps` accepts only `list` and `details`. Local Google reauthentication remains available through `python gsc_server.py --reauthenticate`.
 
-```json
-"GSC_ALLOW_DESTRUCTIVE": "true"
-```
+## Streamable HTTP and Docker (local development)
 
----
-
-## Remote Deployment & Docker (Advanced)
-
-The standard setup runs the server locally. This section is only for users who want to run it on a remote server or in a container.
-
-### HTTP Transport
+Cowork requires [Streamable HTTP over HTTPS](https://learn.microsoft.com/en-us/microsoft-365/copilot/cowork/cowork-plugin-development#connector-requirements). This server provides the HTTP transport; TLS termination and account authentication belong to the later hosting/auth work.
 
 ```bash
-MCP_TRANSPORT=sse MCP_HOST=0.0.0.0 MCP_PORT=3001 python gsc_server.py
+MCP_TRANSPORT=streamable-http uv run python gsc_server.py
 ```
+
+PowerShell:
+
+```powershell
+$env:MCP_TRANSPORT = "streamable-http"
+uv run python gsc_server.py
+```
+
+The endpoint is `http://127.0.0.1:3001/mcp`. It supports JSON-RPC `initialize`, `tools/list`, and `tools/call`, with stateless JSON responses. Clients should send `Accept: application/json, text/event-stream`. There are no `/sse` or `/messages/` routes.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Set to `sse` for network/remote use |
-| `MCP_HOST` | `127.0.0.1` | Host to bind |
-| `MCP_PORT` | `3001` | Port to bind |
+| `MCP_TRANSPORT` | `stdio` | `streamable-http` for HTTP; `http` is an alias |
+| `MCP_HOST` | `127.0.0.1` | Bind address; use `0.0.0.0` inside a container |
+| `MCP_PORT` | `3001` | Port, between 1 and 65535 |
+| `MCP_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` | Comma-separated accepted Host values; include the public hostname when hosting |
+| `MCP_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` | Comma-separated accepted Origins; requests without Origin are allowed |
 
-### Docker
+Host and Origin validation stay enabled. Binding to `0.0.0.0` does not disable them. For the eventual hosted domain, use `MCP_ALLOWED_HOSTS=gsc-mcp.agregated.com.au` and `MCP_ALLOWED_ORIGINS=https://gsc-mcp.agregated.com.au` (adding other trusted values if needed).
 
 ```bash
 docker build -t mcp-gsc .
-
-docker run \
-  -e MCP_TRANSPORT=sse \
+docker run --rm \
+  -e MCP_TRANSPORT=streamable-http \
   -e MCP_HOST=0.0.0.0 \
   -e MCP_PORT=3001 \
+  -e GSC_SKIP_OAUTH=true \
   -e GSC_CREDENTIALS_PATH=/app/credentials.json \
-  -v /path/to/credentials.json:/app/credentials.json \
-  -p 3001:3001 \
+  -v /path/to/credentials.json:/app/credentials.json:ro \
+  -p 127.0.0.1:3001:3001 \
   mcp-gsc
 ```
+
+The service account example is only a single-credential local transport test. The planned multi-user service requires per-user Google connections instead. HTTP mode can refresh an existing valid Google connection but never starts an interactive browser login. Missing/revoked credentials return an actionable setup error.
+
+## Tests
+
+```bash
+uv sync --frozen --group dev
+uv run --frozen pytest -q
+```
+
+Tests mock Google API calls. HTTP tests exercise the real ASGI endpoint, initialization, discovery, read execution, rejection of writes and legacy routes, and Host/Origin checks. Live Google accounts and Cowork are not required for this step.
 
 ---
 
