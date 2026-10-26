@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+from quota_usage import usage_report, execute_tracked, EFFICIENCY_INSTRUCTIONS
 import argparse
 import asyncio
 import logging
@@ -84,6 +85,7 @@ else:
 # JSON responses are part of Streamable HTTP; legacy SSE endpoints are not used.
 mcp = FastMCP(
     "gsc-server",
+    instructions=EFFICIENCY_INSTRUCTIONS,
     streamable_http_path="/mcp",
     stateless_http=True,
     json_response=True,
@@ -335,6 +337,7 @@ def _site_not_found_error(site_url: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_capabilities() -> str:
     """
     Get a full list of all available tools, current auth status, and how to get started.
@@ -370,6 +373,7 @@ async def get_capabilities() -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def list_properties() -> str:
     """
     List all Google Search Console (GSC) properties and sites the user has access to.
@@ -379,7 +383,7 @@ async def list_properties() -> str:
     """
     try:
         service = await asyncio.to_thread(get_gsc_service)
-        site_list = await asyncio.to_thread(service.sites().list().execute)
+        site_list = await asyncio.to_thread(lambda: execute_tracked(service.sites().list(), "other"))
 
         # site_list is typically something like:
         # {
@@ -411,6 +415,7 @@ async def list_properties() -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query", row_limit: int = 20) -> str:
     """
     Get search analytics data for a specific property.
@@ -445,7 +450,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         }
         
         # Execute request
-        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
+        response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=request), "search_analytics"))
         
         if not response.get("rows"):
             return f"No search analytics data found for {site_url} in the last {days} days."
@@ -480,6 +485,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_site_details(site_url: str) -> str:
     """
     Get detailed information about a specific Search Console property.
@@ -493,7 +499,7 @@ async def get_site_details(site_url: str) -> str:
         service = await asyncio.to_thread(get_gsc_service)
         
         # Get site details
-        site_info = await asyncio.to_thread(service.sites().get(siteUrl=site_url).execute)
+        site_info = await asyncio.to_thread(lambda: execute_tracked(service.sites().get(siteUrl=site_url), "other"))
         
         result = {
             "site_url": site_url,
@@ -522,6 +528,7 @@ async def get_site_details(site_url: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_sitemaps(site_url: str) -> str:
     """
     List all sitemaps for a specific Search Console property.
@@ -535,7 +542,7 @@ async def get_sitemaps(site_url: str) -> str:
         service = await asyncio.to_thread(get_gsc_service)
         
         # Get sitemaps list
-        sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url).execute)
+        sitemaps = await asyncio.to_thread(lambda: execute_tracked(service.sitemaps().list(siteUrl=site_url), "other"))
         
         if not sitemaps.get("sitemap"):
             return f"No sitemaps found for {site_url}."
@@ -621,6 +628,7 @@ def _rich_results_summary(inspection: Dict[str, Any]) -> Optional[Dict[str, Any]
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """
     Enhanced URL inspection to check indexing status and rich results in Google.
@@ -641,7 +649,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         }
         
         # Execute request
-        response = await asyncio.to_thread(service.urlInspection().index().inspect(body=request).execute)
+        response = await asyncio.to_thread(lambda: execute_tracked(service.urlInspection().index().inspect(body=request), "url_inspection"))
         
         if not response or "inspectionResult" not in response:
             return f"No inspection data found for {page_url}."
@@ -696,7 +704,7 @@ def _inspect_single_url(site_url: str, page_url: str) -> Dict[str, Any]:
     try:
         service = get_gsc_service()
         request = {"inspectionUrl": page_url, "siteUrl": site_url}
-        response = service.urlInspection().index().inspect(body=request).execute()
+        response = execute_tracked(service.urlInspection().index().inspect(body=request), "url_inspection")
 
         if not response or "inspectionResult" not in response:
             return {"url": page_url, "error": "No inspection data found"}
@@ -730,6 +738,7 @@ def _inspect_single_url(site_url: str, page_url: str) -> Dict[str, Any]:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def batch_url_inspection(site_url: str, urls: str) -> str:
     """
     Inspect multiple URLs in batch (within API limits).
@@ -796,7 +805,7 @@ def _check_indexing_single_url(site_url: str, page_url: str) -> Dict[str, Option
     try:
         service = get_gsc_service()
         request = {"inspectionUrl": page_url, "siteUrl": site_url}
-        response = service.urlInspection().index().inspect(body=request).execute()
+        response = execute_tracked(service.urlInspection().index().inspect(body=request), "url_inspection")
 
         if not response or "inspectionResult" not in response:
             result["not_indexed"] = f"{page_url} - No inspection data found"
@@ -835,6 +844,7 @@ def _check_indexing_single_url(site_url: str, page_url: str) -> Dict[str, Option
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def check_indexing_issues(site_url: str, urls: str) -> str:
     """
     Check for specific indexing issues across multiple URLs.
@@ -908,6 +918,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     Get a performance overview for a specific property.
@@ -933,7 +944,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
             "dataState": DATA_STATE
         }
         
-        total_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=total_request).execute)
+        total_response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=total_request), "search_analytics"))
         
         # Get by date for trend
         date_request = {
@@ -944,7 +955,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
             "dataState": DATA_STATE
         }
         
-        date_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=date_request).execute)
+        date_response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=date_request), "search_analytics"))
         
         if not total_response.get("rows"):
             return f"No performance data available for {site_url} in the last {days} days."
@@ -987,6 +998,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_advanced_search_analytics(
     site_url: str, 
     start_date: str = None, 
@@ -1094,7 +1106,7 @@ async def get_advanced_search_analytics(
             active_filters = [single_filter]
         
         # Execute request
-        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
+        response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=request), "search_analytics"))
         
         if not response.get("rows"):
             no_data_msg = (
@@ -1155,6 +1167,7 @@ async def get_advanced_search_analytics(
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def compare_search_periods(
     site_url: str,
     period1_start: str,
@@ -1210,8 +1223,8 @@ async def compare_search_periods(
         }
         
         # Execute requests
-        period1_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute)
-        period2_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute)
+        period1_response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=period1_request), "search_analytics"))
+        period2_response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=period2_request), "search_analytics"))
         
         period1_rows = period1_response.get("rows", [])
         period2_rows = period2_response.get("rows", [])
@@ -1304,6 +1317,7 @@ async def compare_search_periods(
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_search_by_page_query(
     site_url: str,
     page_url: str,
@@ -1348,7 +1362,7 @@ async def get_search_by_page_query(
         }
         
         # Execute request
-        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
+        response = await asyncio.to_thread(lambda: execute_tracked(service.searchanalytics().query(siteUrl=site_url, body=request), "search_analytics"))
         
         if not response.get("rows"):
             return f"No search data found for page {page_url} in the last {days} days."
@@ -1388,6 +1402,7 @@ async def get_search_by_page_query(
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
     """
     List all sitemaps for a specific Search Console property with detailed information.
@@ -1403,10 +1418,10 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
         
         # Get sitemaps list
         if sitemap_index:
-            sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index).execute)
+            sitemaps = await asyncio.to_thread(lambda: execute_tracked(service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index), "other"))
             source = f"child sitemaps from index: {sitemap_index}"
         else:
-            sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url).execute)
+            sitemaps = await asyncio.to_thread(lambda: execute_tracked(service.sitemaps().list(siteUrl=site_url), "other"))
             source = "all submitted sitemaps"
         
         if not sitemaps.get("sitemap"):
@@ -1458,6 +1473,7 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     Get detailed information about a specific sitemap.
@@ -1472,7 +1488,7 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         service = await asyncio.to_thread(get_gsc_service)
         
         # Get sitemap details
-        details = await asyncio.to_thread(service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute)
+        details = await asyncio.to_thread(lambda: execute_tracked(service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url), "other"))
         
         if not details:
             return f"No details found for sitemap {sitemap_url}."
@@ -1513,6 +1529,7 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
     """
     Read sitemap lists or details without changing Search Console.
@@ -1548,6 +1565,7 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
 @mcp.tool(annotations=ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
+@usage_report
 async def get_creator_info() -> str:
     """
     Provides information about Amin Foroutan, the creator of the MCP-GSC tool.

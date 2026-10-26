@@ -579,3 +579,24 @@ MIT License. See the [LICENSE](LICENSE) file for details.
 ### [0.1.0] — Initial release
 - 19 tools covering property management, search analytics, URL inspection, and sitemap management
 - OAuth and service account authentication
+
+### API request efficiency and usage reporting
+
+The server supplies AI instructions to reuse fetched results, prefer grouped queries,
+limit date ranges and pagination, deduplicate inspection work, and stop tight retries
+on quota errors. These are guidance for the assistant, not an enforced rate limiter.
+
+Tool results include `api_usage.attempted_requests` for Search Analytics, URL
+Inspection and other calls made by that tool, including failed attempts and parallel
+batch workers. Ask the assistant to sum these across a report. Existing JSON object
+results gain an `api_usage` field; text and array results retain their original text
+with an appended JSON usage line.
+
+`remaining_property_quota` is null: Search Console exposes no live remaining-quota
+endpoint. Counts cover this tool call only, not other users, applications or server
+instances. Google processing-load consumption is unknown. No extra Google request
+is made to produce this report. Cloud Monitoring is not connected by this feature.
+
+Published property limits: Search Analytics 1,200 requests/minute; URL Inspection
+2,000/day and 600/minute. User/project and processing-load limits also apply.
+See https://developers.google.com/webmaster-tools/limits for current limits.

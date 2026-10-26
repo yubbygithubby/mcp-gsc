@@ -41,7 +41,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["gsc_server", "google_auth_provider"]
+py-modules = ["gsc_server", "google_auth_provider", "quota_usage"]
 
 [dependency-groups]
 dev = ["pytest>=8.0,<10"]
