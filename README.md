@@ -9,13 +9,13 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ## Cowork transport adaptation (this fork)
 
-This fork implements step 1 of the Cowork integration: **Streamable HTTP at `/mcp`** and a **read-only GSC tool surface**. Local stdio clients still work.
+This fork provides **Streamable HTTP at `/mcp`**, Google sign-in for approved team accounts, and a **read-only GSC tool surface**. Local stdio clients still work.
 
-- Remote mode: `MCP_TRANSPORT=streamable-http` (`http` is an alias). Legacy `sse` is rejected.
+- HTTP mode: `MCP_TRANSPORT=streamable-http` (`http` is an alias). Legacy `sse` is rejected.
 - GSC scope: `https://www.googleapis.com/auth/webmasters.readonly`.
 - Property creation/removal and sitemap submission/removal have been removed. `GSC_ALLOW_DESTRUCTIVE` has no effect.
-- `reauthenticate` is a local command, never a remote tool. HTTP requests never launch Google login.
-- This is a local development foundation. It still uses one server-side Google credential store. Per-user Google connections, MCP OAuth/token validation, production hosting and the Cowork plugin are later steps. **Do not expose this endpoint publicly before adding authentication and user isolation.**
+- `reauthenticate` is a local command, never a remote tool. Public HTTP uses a separate browser sign-in flow for each user.
+- Public mode requires an HTTPS URL, approved email list, Google Web OAuth client, persistent encrypted token store, and HTTPS reverse proxy. The Cowork plugin and live hosting are separate deployment steps.
 
 Install this fork from source (the public PyPI package still contains the upstream server):
 
@@ -26,7 +26,7 @@ git checkout codex/streamable-http-readonly
 uv sync --frozen
 ```
 
-For local Google OAuth testing, configure a Desktop OAuth client with the existing upstream setup below, then run `uv run python gsc_server.py --reauthenticate`. Use a fresh `GSC_CONFIG_DIR` or reconnect to replace any previously granted full-access token. Changing the requested scope does not revoke an existing Google grant. A Web application client and per-user token storage will be added with the later account-connection work.
+For local Google OAuth testing, configure a Desktop OAuth client with the existing upstream setup below, then run `uv run python gsc_server.py --reauthenticate`. Use a fresh `GSC_CONFIG_DIR` or reconnect to replace any previously granted full-access token. Changing the requested scope does not revoke an existing Google grant. Public mode uses a separate Web application client as described below.
 
 For a local stdio client, use `uv run --directory /absolute/path/to/mcp-gsc python gsc_server.py`. The upstream PyPI and marketplace installation examples below do not install this fork.
 
@@ -88,17 +88,19 @@ For a local stdio client, use `uv run --directory /absolute/path/to/mcp-gsc pyth
 | `get_performance_overview` | Summary of site performance | Site URL, time period |
 | `compare_search_periods` | Compare performance between two time periods | Site URL, two date ranges |
 | `get_search_by_page_query` | Search terms driving traffic to a specific page | Site URL, page URL |
-| `get_advanced_search_analytics` | Analytics with filters by country, device, query, page | Site URL |
+| `get_advanced_search_analytics` | Analytics with filters and sorting within the returned click-ranked rows | Site URL |
 | `inspect_url_enhanced` | Detailed crawl/index status for a URL | Site URL, page URL |
 | `batch_url_inspection` | Inspect up to 10 URLs at once | Site URL, list of URLs |
 | `check_indexing_issues` | Check multiple URLs for indexing problems | Site URL, list of URLs |
-| `get_sitemaps` | Lists all sitemaps for a site | Site URL |
+| `get_sitemaps` | Lists sitemaps and submitted URL counts for a site | Site URL |
 | `list_sitemaps_enhanced` | Detailed sitemap info including errors and warnings | Site URL |
-| `get_sitemap_details` | Read details for a sitemap | Site URL, sitemap URL |
+| `get_sitemap_details` | Read sitemap details and submitted URL counts | Site URL, sitemap URL |
 | `manage_sitemaps` | Read sitemap lists or details | Site URL, read action |
 | `get_creator_info` | Information about the upstream creator | Nothing |
 
 *Ask your AI assistant to "call get_capabilities" for the full list of all 16 read-only tools.*
+
+Search Analytics returns rows ranked by clicks. `get_advanced_search_analytics` sorts only the returned rows (`sort_scope: "returned_rows"`), so sorting a 1,000-row response by impressions does not find the site's global top 1,000 by impressions. Sitemap `submitted_urls` counts URLs listed in the sitemap; it is not an indexed-page count.
 
 ---
 
@@ -442,9 +444,9 @@ The MCP server runs locally on your machine. It only works in the **Claude Deskt
 
 All 16 MCP tools declare `readOnlyHint=true` and `destructiveHint=false`. Search Console writes are absent from discovery and cannot be invoked through `tools/call`, even with `GSC_ALLOW_DESTRUCTIVE=true`. `manage_sitemaps` accepts only `list` and `details`. Local Google reauthentication remains available through `python gsc_server.py --reauthenticate`.
 
-## Streamable HTTP and Docker (local development)
+## Streamable HTTP
 
-Cowork requires [Streamable HTTP over HTTPS](https://learn.microsoft.com/en-us/microsoft-365/copilot/cowork/cowork-plugin-development#connector-requirements). This server provides the HTTP transport; TLS termination and account authentication belong to the later hosting/auth work.
+Local HTTP is available for development on loopback. It has no caller authentication, so keep it on your machine:
 
 ```bash
 MCP_TRANSPORT=streamable-http uv run python gsc_server.py
@@ -462,27 +464,37 @@ The endpoint is `http://127.0.0.1:3001/mcp`. It supports JSON-RPC `initialize`, 
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_TRANSPORT` | `stdio` | `streamable-http` for HTTP; `http` is an alias |
-| `MCP_HOST` | `127.0.0.1` | Bind address; use `0.0.0.0` inside a container |
+| `MCP_HOST` | `127.0.0.1` | Bind address; public binding requires the Google sign-in settings below |
 | `MCP_PORT` | `3001` | Port, between 1 and 65535 |
-| `MCP_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` | Comma-separated accepted Host values; include the public hostname when hosting |
+| `MCP_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` | Comma-separated accepted Host values |
 | `MCP_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` | Comma-separated accepted Origins; requests without Origin are allowed |
 
-Host and Origin validation stay enabled. Binding to `0.0.0.0` does not disable them. For the eventual hosted domain, use `MCP_ALLOWED_HOSTS=gsc-mcp.agregated.com.au` and `MCP_ALLOWED_ORIGINS=https://gsc-mcp.agregated.com.au` (adding other trusted values if needed).
+Host and Origin validation stay enabled. Do not expose local mode through a reverse proxy or tunnel. Local HTTP can refresh an existing Google connection but does not start an interactive login.
 
-```bash
-docker build -t mcp-gsc .
-docker run --rm \
-  -e MCP_TRANSPORT=streamable-http \
-  -e MCP_HOST=0.0.0.0 \
-  -e MCP_PORT=3001 \
-  -e GSC_SKIP_OAUTH=true \
-  -e GSC_CREDENTIALS_PATH=/app/credentials.json \
-  -v /path/to/credentials.json:/app/credentials.json:ro \
-  -p 127.0.0.1:3001:3001 \
-  mcp-gsc
-```
+### Public HTTPS for your team
 
-The service account example is only a single-credential local transport test. The planned multi-user service requires per-user Google connections instead. HTTP mode can refresh an existing valid Google connection but never starts an interactive browser login. Missing/revoked credentials return an actionable setup error.
+Public mode is designed for `https://gsc-mcp.agregated.com.au/mcp`. Every MCP client connects with its own MCP OAuth tokens, and each approved teammate signs into their **own Google account**. Search Console permissions come from that account. The server does not pass Google tokens to MCP clients or fall back to local credentials. Codex, Claude Code, and Cowork can use the same endpoint through OAuth dynamic client registration. The sign-in page shows the client name and return address before the user approves access.
+
+Create a **Google OAuth Web application** with authorized redirect URI `https://gsc-mcp.agregated.com.au/google/callback`. Enable the Search Console API. Request access for the `openid`, `email`, and `https://www.googleapis.com/auth/webmasters.readonly` scopes. Google may require app verification for production use of the Search Console scope; an app left in Testing mode may have short-lived refresh tokens. Each teammate must also have Search Console access to the properties they want to query.
+
+Set these variables on the server (for example, as private host secrets):
+
+| Variable | Value |
+|---|---|
+| `MCP_TRANSPORT` | `streamable-http` |
+| `MCP_PUBLIC_URL` | `https://gsc-mcp.agregated.com.au/mcp` |
+| `MCP_HOST` | `0.0.0.0` inside a private container network, or `127.0.0.1` behind a same-host HTTPS proxy |
+| `MCP_PORT` | `3001` unless your host needs another port |
+| `MCP_GOOGLE_CLIENT_SECRETS_FILE` | Absolute path to the Google **Web application** client JSON |
+| `MCP_ALLOWED_EMAILS` | Comma-separated Google account email addresses allowed to use the server |
+| `MCP_TOKEN_DB` | Absolute path to a persistent SQLite file in a writable directory |
+| `MCP_TOKEN_ENCRYPTION_KEY` | Stable Fernet key; generate once with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+
+Keep the Web client JSON, encryption key, and SQLite file private. Back up the key and database together; changing the key invalidates stored Google credentials and client tokens. Removing an email from `MCP_ALLOWED_EMAILS` immediately rejects that person's MCP tokens, including refresh tokens.
+
+Put an HTTPS reverse proxy in front of the server, preserve the original `Host` header, and route **all paths** (`/mcp`, `/authorize`, `/token`, `/register`, `/google/callback`, `/google/approve`, and `/.well-known/*`) to the app. Keep the app port off the public Internet; allow public access only through TLS on the named domain. Rate-limit the public OAuth endpoints, especially `/register` and `/authorize`. Do not rewrite `/mcp` to another path. Store the SQLite file on a persistent volume and run one app instance against it. The Google client JSON must contain the exact callback above. Public mode refuses to start when any required setting is absent.
+
+In Codex or Claude Code, add a remote HTTP MCP server with URL `https://gsc-mcp.agregated.com.au/mcp` and complete the browser sign-in. In a Cowork plugin, configure this as a Streamable HTTP MCP connector using OAuth with dynamic client registration. No Microsoft tenant is required. The client needs to support the standard MCP OAuth flow and PKCE. The server's protected-resource and authorization-server metadata are discoverable from the public URL.
 
 ## Tests
 
@@ -491,7 +503,7 @@ uv sync --frozen --group dev
 uv run --frozen pytest -q
 ```
 
-Tests mock Google API calls. HTTP tests exercise the real ASGI endpoint, initialization, discovery, read execution, rejection of writes and legacy routes, and Host/Origin checks. Live Google accounts and Cowork are not required for this step.
+Tests mock Google API calls. HTTP tests exercise the real ASGI endpoint, OAuth registration and token exchange, initialization, discovery, read execution, rejection of writes and legacy routes, and Host/Origin checks. Live Google accounts and Cowork are not required for this step.
 
 ---
 

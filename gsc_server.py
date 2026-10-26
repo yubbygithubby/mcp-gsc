@@ -6,7 +6,10 @@ import os
 import json
 import sys
 import shutil
+import tempfile
+import threading
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # Fail loudly on unsupported Python. The mcp/FastMCP dependency requires 3.11+.
 # On Python 3.10 or older the server dies during import, and when it is launched
@@ -29,7 +32,6 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 # Suppress the noisy file_cache warning from google-api-python-client.
 # Some MCP hosts (e.g. GitHub Copilot CLI) treat any stderr output as a
@@ -38,11 +40,45 @@ logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 # MCP
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.requests import Request as StarletteRequest
+from urllib.parse import urlparse
+
+from google_auth_provider import GoogleAuthProvider, MCP_SCOPE
 
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
 IS_REMOTE = TRANSPORT != "stdio"
+PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").strip()
+if PUBLIC_URL:
+    parsed_public_url = urlparse(PUBLIC_URL)
+    if (TRANSPORT not in {"http", "streamable-http"} or parsed_public_url.scheme != "https"
+            or not parsed_public_url.hostname or parsed_public_url.path != "/mcp"
+            or parsed_public_url.query or parsed_public_url.fragment or parsed_public_url.username
+            or parsed_public_url.password):
+        raise ValueError("MCP_PUBLIC_URL must be an HTTPS URL ending in /mcp and requires HTTP transport")
+    required = ["MCP_GOOGLE_CLIENT_SECRETS_FILE", "MCP_ALLOWED_EMAILS", "MCP_TOKEN_DB", "MCP_TOKEN_ENCRYPTION_KEY"]
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise ValueError("Public mode requires " + ", ".join(missing))
+    AUTH_PROVIDER = GoogleAuthProvider(
+        PUBLIC_URL, os.environ["MCP_GOOGLE_CLIENT_SECRETS_FILE"],
+        os.environ["MCP_ALLOWED_EMAILS"], os.environ["MCP_TOKEN_DB"],
+        os.environ["MCP_TOKEN_ENCRYPTION_KEY"],
+    )
+    AUTH_SETTINGS = AuthSettings(
+        issuer_url=f"{parsed_public_url.scheme}://{parsed_public_url.netloc}",
+        resource_server_url=PUBLIC_URL,
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=[MCP_SCOPE], default_scopes=[MCP_SCOPE],
+        ),
+        required_scopes=[MCP_SCOPE],
+    )
+else:
+    AUTH_PROVIDER = None
+    AUTH_SETTINGS = None
 
 # Stateless requests avoid session affinity when the server is eventually hosted.
 # JSON responses are part of Streamable HTTP; legacy SSE endpoints are not used.
@@ -51,7 +87,18 @@ mcp = FastMCP(
     streamable_http_path="/mcp",
     stateless_http=True,
     json_response=True,
+    auth_server_provider=AUTH_PROVIDER,
+    auth=AUTH_SETTINGS,
 )
+
+if AUTH_PROVIDER:
+    @mcp.custom_route("/google/callback", methods=["GET"])
+    async def google_callback(request: StarletteRequest):
+        return await AUTH_PROVIDER.google_callback(request)
+
+    @mcp.custom_route("/google/approve", methods=["POST"])
+    async def google_approve(request: StarletteRequest):
+        return await AUTH_PROVIDER.google_approve(request)
 
 def _expand_path(path: Optional[str]) -> Optional[str]:
     """Expand ``~`` and environment variables in a path, returning None for empty input.
@@ -113,12 +160,39 @@ if _raw_data_state not in ("all", "final"):
 DATA_STATE = _raw_data_state
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+_OAUTH_LOCK = threading.Lock()
+
+
+def _date_range(days: int):
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    end = datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    return end - timedelta(days=days - 1), end
+
+
+def _save_token(creds):
+    """Replace the OAuth token only after the new credentials are safely written."""
+    token_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(TOKEN_FILE), prefix="token-", suffix=".json", delete=False) as token:
+            token_path = token.name
+            token.write(creds.to_json())
+        os.replace(token_path, TOKEN_FILE)
+    finally:
+        if token_path and os.path.exists(token_path):
+            os.remove(token_path)
 
 def get_gsc_service():
     """
     Returns an authorized Search Console service object.
-    First tries OAuth authentication, then falls back to service account.
+    Uses OAuth when configured, otherwise a service account.
     """
+    if AUTH_PROVIDER:
+        access = get_access_token()
+        if not access or not access.subject:
+            raise PermissionError("An authenticated Google account is required")
+        return AUTH_PROVIDER.get_service(access.subject)
+
     # Fail-fast if credential env vars are set but point to files that don't exist.
     # Without this, a typo'd or uvx-incompatible path would silently fall through to
     # SCRIPT_DIR/cwd fallbacks (which don't work under uvx) and emit a misleading
@@ -127,7 +201,12 @@ def get_gsc_service():
     # GSC_OAUTH_CLIENT_SECRETS_FILE_EXPLICIT) rather than re-reading os.environ at
     # call time, because the env var may have been cleared by the caller after module
     # import (e.g. by test frameworks or MCP hosts that scope env vars narrowly).
-    if GSC_CREDENTIALS_PATH and not os.path.exists(GSC_CREDENTIALS_PATH):
+    use_oauth = not SKIP_OAUTH and (
+        os.path.exists(TOKEN_FILE)
+        or os.path.exists(OAUTH_CLIENT_SECRETS_FILE)
+        or GSC_OAUTH_CLIENT_SECRETS_FILE_EXPLICIT
+    )
+    if not use_oauth and GSC_CREDENTIALS_PATH and not os.path.exists(GSC_CREDENTIALS_PATH):
         raise FileNotFoundError(
             f"GSC_CREDENTIALS_PATH is set to {GSC_CREDENTIALS_PATH!r} but the file "
             f"does not exist. "
@@ -135,7 +214,7 @@ def get_gsc_service():
             f"credentials JSON file — placing the file in your project folder is not "
             f"sufficient because uvx runs the code from an internal cache directory."
         )
-    if GSC_OAUTH_CLIENT_SECRETS_FILE_EXPLICIT and not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
+    if use_oauth and GSC_OAUTH_CLIENT_SECRETS_FILE_EXPLICIT and not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
         raise FileNotFoundError(
             f"GSC_OAUTH_CLIENT_SECRETS_FILE is set to {OAUTH_CLIENT_SECRETS_FILE!r} "
             f"but the file does not exist. "
@@ -143,25 +222,18 @@ def get_gsc_service():
             f"client_secrets.json file."
         )
 
-    # Try OAuth authentication first if not skipped
-    if not SKIP_OAUTH:
-        try:
+    # A configured OAuth identity must not silently switch to a service account.
+    if use_oauth:
+        with _OAUTH_LOCK:
             return get_gsc_service_oauth()
-        except Exception as e:
-            # If OAuth fails, try service account
-            logging.warning("OAuth authentication failed: %s", e)
-            pass
     
     # Try service account authentication
-    for cred_path in POSSIBLE_CREDENTIAL_PATHS:
+    for cred_path in ([GSC_CREDENTIALS_PATH] if GSC_CREDENTIALS_PATH else POSSIBLE_CREDENTIAL_PATHS[1:]):
         if cred_path and os.path.exists(cred_path):
-            try:
-                creds = service_account.Credentials.from_service_account_file(
-                    cred_path, scopes=SCOPES
-                )
-                return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
-            except Exception as e:
-                continue  # Try the next path if this one fails
+            creds = service_account.Credentials.from_service_account_file(
+                cred_path, scopes=SCOPES
+            )
+            return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
     
     # If we get here, none of the authentication methods worked.
     # Note: uvx users can't place files "in the script directory" because uvx runs
@@ -203,15 +275,11 @@ def get_gsc_service_oauth():
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                # Save the refreshed credentials
-                with open(TOKEN_FILE, 'w') as token:
-                    token.write(creds.to_json())
-            except Exception as e:
-                # If refresh fails, delete the bad token and trigger new OAuth flow
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
-                # Fall through to the OAuth flow below
+            except Exception:
+                # Keep the old token if a transient refresh failure prevents login.
                 creds = None
+            else:
+                _save_token(creds)
         
         # Start new OAuth flow if we don't have valid credentials
         if not creds or not creds.valid:
@@ -219,7 +287,7 @@ def get_gsc_service_oauth():
                 raise RuntimeError(
                     "Google credentials are unavailable or expired. Complete Google login "
                     "locally with `python gsc_server.py --reauthenticate` before starting "
-                    "the HTTP server. Remote per-user account connections are not implemented yet."
+                    "the local HTTP server. Public mode uses browser sign-in for each user."
                 )
 
             # Check if client secrets file exists
@@ -234,8 +302,7 @@ def get_gsc_service_oauth():
             creds = flow.run_local_server(port=0)
             
             # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
-                token.write(creds.to_json())
+            _save_token(creds)
     
     # Build and return the service
     return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
@@ -276,7 +343,7 @@ async def get_capabilities() -> str:
     Also shows if authentication is needed.
     """
     try:
-        get_gsc_service()
+        await asyncio.to_thread(get_gsc_service)
         auth_status = "authenticated"
         auth_error = None
     except Exception as exc:
@@ -290,9 +357,11 @@ async def get_capabilities() -> str:
         "auth_error": auth_error,
         "tools": [{"name": tool.name, "description": tool.description} for tool in tools],
         "getting_started": [
-            "For local testing, configure credentials on the server. "
-            "Run `python gsc_server.py --reauthenticate` locally for Google login. "
-            "Remote per-user account connections are not implemented yet.",
+            ("Your MCP client is connected with your Google account. "
+             "Call list_properties to see properties available to you."
+             if AUTH_PROVIDER else
+             "For local testing, configure credentials on the server. "
+             "Run `python gsc_server.py --reauthenticate` locally for Google login."),
             "Call list_properties to get the exact site_url for other tools.",
         ],
     })
@@ -309,8 +378,8 @@ async def list_properties() -> str:
     exact site_url needed for other tools.
     """
     try:
-        service = get_gsc_service()
-        site_list = service.sites().list().execute()
+        service = await asyncio.to_thread(get_gsc_service)
+        site_list = await asyncio.to_thread(service.sites().list().execute)
 
         # site_list is typically something like:
         # {
@@ -358,11 +427,10 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
                    beyond 500 rows, use get_advanced_search_analytics which supports pagination.
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Calculate date range
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+        start_date, end_date = _date_range(days)
         
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
@@ -377,7 +445,7 @@ async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = 
         }
         
         # Execute request
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
         
         if not response.get("rows"):
             return f"No search analytics data found for {site_url} in the last {days} days."
@@ -422,10 +490,10 @@ async def get_site_details(site_url: str) -> str:
                   domain property as site_url and filter by page to analyze a specific subdomain.
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Get site details
-        site_info = service.sites().get(siteUrl=site_url).execute()
+        site_info = await asyncio.to_thread(service.sites().get(siteUrl=site_url).execute)
         
         result = {
             "site_url": site_url,
@@ -464,10 +532,10 @@ async def get_sitemaps(site_url: str) -> str:
                   domain property as site_url and filter by page to analyze a specific subdomain.
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Get sitemaps list
-        sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
+        sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url).execute)
         
         if not sitemaps.get("sitemap"):
             return f"No sitemaps found for {site_url}."
@@ -491,18 +559,18 @@ async def get_sitemaps(site_url: str) -> str:
             elif warnings > 0:
                 status = "Has warnings"
 
-            indexed_urls = None
+            submitted_urls = None
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
-                        indexed_urls = content.get("submitted")
+                        submitted_urls = content.get("submitted")
                         break
 
             sitemap_list.append({
                 "path": sitemap.get("path", "Unknown"),
                 "last_downloaded": last_downloaded,
                 "status": status,
-                "indexed_urls": indexed_urls,
+                "submitted_urls": submitted_urls,
                 "errors": errors,
                 "warnings": warnings,
             })
@@ -564,7 +632,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         page_url: The specific URL to inspect
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Build request
         request = {
@@ -573,7 +641,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         }
         
         # Execute request
-        response = service.urlInspection().index().inspect(body=request).execute()
+        response = await asyncio.to_thread(service.urlInspection().index().inspect(body=request).execute)
         
         if not response or "inspectionResult" not in response:
             return f"No inspection data found for {page_url}."
@@ -678,7 +746,7 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
     try:
         # Validate auth once up front. This also refreshes the OAuth token a single
         # time so the concurrent workers below reuse it without racing on token.json.
-        get_gsc_service()
+        await asyncio.to_thread(get_gsc_service)
 
         # Parse URLs
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
@@ -780,7 +848,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
     try:
         # Validate auth once up front (also refreshes the token so the concurrent
         # workers below reuse it without racing on token.json).
-        get_gsc_service()
+        await asyncio.to_thread(get_gsc_service)
 
         # Parse URLs
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
@@ -851,11 +919,10 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         days: Number of days to look back (default: 28)
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Calculate date range
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+        start_date, end_date = _date_range(days)
         
         # Get total metrics
         total_request = {
@@ -866,7 +933,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
             "dataState": DATA_STATE
         }
         
-        total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
+        total_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=total_request).execute)
         
         # Get by date for trend
         date_request = {
@@ -877,7 +944,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
             "dataState": DATA_STATE
         }
         
-        date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
+        date_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=date_request).execute)
         
         if not total_response.get("rows"):
             return f"No performance data available for {site_url} in the last {days} days."
@@ -938,6 +1005,7 @@ async def get_advanced_search_analytics(
 ) -> str:
     """
     Get advanced search analytics data with sorting, filtering, and pagination.
+    Sorting only reorders the returned click-ranked page of rows.
     
     Args:
         site_url: Exact GSC property URL from list_properties (e.g. "https://example.com/" or
@@ -965,13 +1033,13 @@ async def get_advanced_search_analytics(
         data_state: Data freshness — "all" (default, matches GSC dashboard) or "final" (confirmed data only, 2-3 day lag)
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Calculate date range if not provided
         if not end_date:
-            end_date = datetime.now().date().strftime("%Y-%m-%d")
+            end_date = _date_range(28)[1].strftime("%Y-%m-%d")
         if not start_date:
-            start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
+            start_date = (datetime.strptime(end_date, "%Y-%m-%d").date() - timedelta(days=27)).strftime("%Y-%m-%d")
         
         # Resolve and validate data_state (per-call override or fall back to global setting)
         resolved_data_state = (data_state or DATA_STATE).lower().strip()
@@ -1026,7 +1094,7 @@ async def get_advanced_search_analytics(
             active_filters = [single_filter]
         
         # Execute request
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
         
         if not response.get("rows"):
             no_data_msg = (
@@ -1068,6 +1136,7 @@ async def get_advanced_search_analytics(
             "site_url": site_url,
             "date_range": {"start": start_date, "end": end_date},
             "search_type": search_type,
+            "sort_scope": "returned_rows",
             "dimensions": dimension_list,
             "filters_applied": active_filters,
             "pagination": {
@@ -1118,7 +1187,7 @@ async def compare_search_periods(
         limit: Number of top results to compare (default: 10)
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
@@ -1141,8 +1210,8 @@ async def compare_search_periods(
         }
         
         # Execute requests
-        period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-        period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+        period1_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute)
+        period2_response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute)
         
         period1_rows = period1_response.get("rows", [])
         period2_rows = period2_response.get("rows", [])
@@ -1172,7 +1241,8 @@ async def compare_search_periods(
             imp_pct = (imp_diff / p2_row.get("impressions", 1)) * 100 if p2_row.get("impressions", 0) > 0 else float('inf')
             
             ctr_diff = p1_row.get("ctr", 0) - p2_row.get("ctr", 0)
-            pos_diff = p2_row.get("position", 0) - p1_row.get("position", 0)  # lower position is better, so positive = Period 1 improved
+            pos_diff = (p2_row.get("position", 0) - p1_row.get("position", 0)
+                        if key in period1_data and key in period2_data else None)
             
             comparison_data.append({
                 "key": key,
@@ -1212,9 +1282,9 @@ async def compare_search_periods(
                 "p1_ctr": round(item["p1_ctr"], 4),
                 "p2_ctr": round(item["p2_ctr"], 4),
                 "ctr_diff": round(item["ctr_diff"], 4),
-                "p1_position": round(item["p1_position"], 1),
-                "p2_position": round(item["p2_position"], 1),
-                "position_diff": round(item["pos_diff"], 1),
+                "p1_position": round(item["p1_position"], 1) if item["key"] in period1_data else None,
+                "p2_position": round(item["p2_position"], 1) if item["key"] in period2_data else None,
+                "position_diff": round(item["pos_diff"], 1) if item["pos_diff"] is not None else None,
             })
 
         return json.dumps({
@@ -1254,11 +1324,10 @@ async def get_search_by_page_query(
                    beyond 500 rows, use get_advanced_search_analytics which supports pagination.
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Calculate date range
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+        start_date, end_date = _date_range(days)
         
         # Build request with page filter
         request = {
@@ -1279,7 +1348,7 @@ async def get_search_by_page_query(
         }
         
         # Execute request
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        response = await asyncio.to_thread(service.searchanalytics().query(siteUrl=site_url, body=request).execute)
         
         if not response.get("rows"):
             return f"No search data found for page {page_url} in the last {days} days."
@@ -1330,14 +1399,14 @@ async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> st
         sitemap_index: Optional sitemap index URL to list child sitemaps
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Get sitemaps list
         if sitemap_index:
-            sitemaps = service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index).execute()
+            sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index).execute)
             source = f"child sitemaps from index: {sitemap_index}"
         else:
-            sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
+            sitemaps = await asyncio.to_thread(service.sitemaps().list(siteUrl=site_url).execute)
             source = "all submitted sitemaps"
         
         if not sitemaps.get("sitemap"):
@@ -1400,10 +1469,10 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         sitemap_url: The full URL of the sitemap to inspect
     """
     try:
-        service = get_gsc_service()
+        service = await asyncio.to_thread(get_gsc_service)
         
         # Get sitemap details
-        details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+        details = await asyncio.to_thread(service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute)
         
         if not details:
             return f"No details found for sitemap {sitemap_url}."
@@ -1513,17 +1582,11 @@ Amin combines technical SEO knowledge with programming skills to create innovati
 
 async def reauthenticate() -> str:
     """
-    Perform a logout and new login sequence.
-    Deletes the current OAuth token file and triggers the browser authentication flow.
+    Authenticate a new Google account and replace the saved OAuth token.
     Useful when you need to switch to a different Google account.
     """
     try:
-        # Delete existing token to force re-authentication
-        if os.path.exists(TOKEN_FILE):
-            os.remove(TOKEN_FILE)
-            token_deleted = True
-        else:
-            token_deleted = False
+        had_token = os.path.exists(TOKEN_FILE)
 
         # Check if OAuth client secrets file exists
         if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
@@ -1540,13 +1603,11 @@ async def reauthenticate() -> str:
         flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
         creds = flow.run_local_server(port=0)
 
-        # Save the new credentials for future use
-        with open(TOKEN_FILE, "w") as token:
-            token.write(creds.to_json())
+        _save_token(creds)
 
         msg = "Successfully authenticated with a new Google account."
-        if token_deleted:
-            msg = "Previous session deleted. " + msg
+        if had_token:
+            msg = "Previous session replaced. " + msg
         return msg
 
     except Exception as e:
@@ -1555,7 +1616,10 @@ async def reauthenticate() -> str:
 
 def configure_http():
     """Configure the single /mcp endpoint without disabling Host/Origin checks."""
-    mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
+    host = os.environ.get("MCP_HOST", "127.0.0.1").strip()
+    if not AUTH_PROVIDER and host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("Public HTTP binding requires MCP_PUBLIC_URL and Google sign-in settings")
+    mcp.settings.host = host
     try:
         port = int(os.environ.get("MCP_PORT", "3001"))
     except ValueError as exc:
@@ -1568,12 +1632,14 @@ def configure_http():
         raw = os.environ.get(name)
         return [value.strip() for value in raw.split(",") if value.strip()] if raw else defaults
 
+    public_host = [urlparse(PUBLIC_URL).netloc] if AUTH_PROVIDER else ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    public_origin = [AUTH_PROVIDER.origin] if AUTH_PROVIDER else [
+        "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+    ]
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=values("MCP_ALLOWED_HOSTS", ["127.0.0.1:*", "localhost:*", "[::1]:*"]),
-        allowed_origins=values("MCP_ALLOWED_ORIGINS", [
-            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
-        ]),
+        allowed_hosts=values("MCP_ALLOWED_HOSTS", public_host),
+        allowed_origins=values("MCP_ALLOWED_ORIGINS", public_origin),
     )
 
 

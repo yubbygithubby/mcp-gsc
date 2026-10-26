@@ -1,5 +1,7 @@
 """Protocol-level HTTP tests; Google calls are mocked and no login is needed."""
+import asyncio
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,18 +156,38 @@ def test_host_and_origin_checks(client):
     assert client.post("/mcp", json={}, headers={"origin": "https://attacker.example"}).status_code == 403
 
 
-def test_configured_public_host_is_allowed(server, monkeypatch):
-    monkeypatch.setenv("MCP_ALLOWED_HOSTS", "gsc-mcp.agregated.com.au")
-    monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://gsc-mcp.agregated.com.au")
-    server.configure_http()
-    with TestClient(server.mcp.streamable_http_app(), base_url="https://gsc-mcp.agregated.com.au") as client:
-        client.headers["accept"] = "application/json, text/event-stream"
-        assert rpc(client, "tools/list").status_code == 200
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.1", "gsc-mcp.agregated.com.au"])
+def test_nonlocal_bind_rejected(server, monkeypatch, host):
+    monkeypatch.setenv("MCP_HOST", host)
+    with pytest.raises(ValueError, match="Public HTTP binding"):
+        server.configure_http()
 
 
 def test_no_legacy_sse_routes(client):
     assert client.get("/sse").status_code == 404
     assert client.post("/messages/", json={}).status_code == 404
+
+
+def test_google_call_does_not_block_other_http_work(server):
+    release = threading.Event()
+    service = MagicMock()
+    service.sites().list().execute.side_effect = lambda: (release.wait(0.5) and {"siteEntry": []})
+
+    async def check():
+        task = asyncio.create_task(server.list_properties())
+        await asyncio.sleep(0.02)
+        assert not task.done(), "A blocking Google request stalled the event loop"
+        release.set()
+        await task
+
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+    try:
+        with patch.object(server, "get_gsc_service", return_value=service):
+            asyncio.run(check())
+    finally:
+        release.set()
+        timer.join()
 
 
 @pytest.mark.parametrize("transport,expected", [
