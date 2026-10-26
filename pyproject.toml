@@ -22,13 +22,15 @@ dependencies = [
     "google-api-python-client>=2.163.0",
     "google-auth-httplib2>=0.2.0",
     "google-auth-oauthlib>=1.2.1",
-    "mcp[cli]>=1.3.0,<2.0.0",
+    "cryptography>=49.0.0",
+    "mcp[cli]>=1.27.0,<2.0.0",
     "platformdirs>=4.0.0",
+    "tzdata>=2026.1",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/AminForou/mcp-gsc"
-"Bug Tracker" = "https://github.com/AminForou/mcp-gsc/issues"
+"Homepage" = "https://github.com/yubbygithubby/mcp-gsc"
+"Bug Tracker" = "https://github.com/yubbygithubby/mcp-gsc/issues"
 
 [project.scripts]
 mcp-gsc = "gsc_server:main"
@@ -39,4 +41,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["gsc_server"]
+py-modules = ["gsc_server", "google_auth_provider", "quota_usage"]
+
+[dependency-groups]
+dev = ["pytest>=8.0,<10"]

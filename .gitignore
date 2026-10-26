@@ -39,6 +39,7 @@ desktop.ini
 .coverage.*
 htmlcov/
 .pytest_cache/
+.test-config/
 .tox/
 nosetests.xml
 coverage.xml
@@ -56,3 +57,11 @@ FORK_ANALYSIS.md
 MCP_LEARNINGS.md
 fork-review.html
 issue-triage.html
+
+# Local test runs and deployment exposure audits
+.audit-pytest-*/
+.quota-test-tmp/
+deployed-gsc-server.snapshot.py
+exposure-check-results.txt
+exposure_check.py
+server-exposure-review-*.md

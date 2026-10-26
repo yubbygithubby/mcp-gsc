@@ -13,16 +13,14 @@ Surface quick-win content optimization targets: pages or queries sitting in posi
 1. Call `list_properties` to confirm the exact `site_url`.
 2. Call `get_advanced_search_analytics` with:
    - `dimensions=query,page`
-   - `sort_by=impressions`
-   - `sort_direction=descending`
    - `row_limit=1000`
-   - `start_date` = 28 days ago, `end_date` = today
+   - use the tool's default 28-day date range
 3. Filter the results to keep only rows where:
    - `position` is between **11 and 20** (page 2, just below the fold)
    - `impressions` > 100 (meaningful search volume)
    - `ctr` < 0.03 (3% — below average for these positions)
-4. Sort the filtered set by `impressions` descending.
-5. Return the top 20 rows.
+4. Sort the filtered set by `impressions` descending. This ranks the returned click-ranked sample, not every query and page on the site.
+5. Return up to 20 rows from that sample and state the sample limit.
 
 ## Output format
 

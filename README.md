@@ -7,6 +7,29 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 ---
 
+## Cowork transport adaptation (this fork)
+
+This fork provides **Streamable HTTP at `/mcp`**, Google sign-in for approved team accounts, and a **read-only GSC tool surface**. Local stdio clients still work.
+
+- HTTP mode: `MCP_TRANSPORT=streamable-http` (`http` is an alias). Legacy `sse` is rejected.
+- GSC scope: `https://www.googleapis.com/auth/webmasters.readonly`.
+- Property creation/removal and sitemap submission/removal have been removed. `GSC_ALLOW_DESTRUCTIVE` has no effect.
+- `reauthenticate` is a local command, never a remote tool. Public HTTP uses a separate browser sign-in flow for each user.
+- Public mode requires an HTTPS URL, approved email list, Google Web OAuth client, persistent encrypted token store, and HTTPS reverse proxy. The Cowork plugin and live hosting are separate deployment steps.
+
+Install this fork from source (the public PyPI package still contains the upstream server):
+
+```bash
+git clone https://github.com/yubbygithubby/mcp-gsc.git
+cd mcp-gsc
+git checkout codex/streamable-http-readonly
+uv sync --frozen
+```
+
+For local Google OAuth testing, configure a Desktop OAuth client with the existing upstream setup below, then run `uv run python gsc_server.py --reauthenticate`. Use a fresh `GSC_CONFIG_DIR` or reconnect to replace any previously granted full-access token. Changing the requested scope does not revoke an existing Google grant. Public mode uses a separate Web application client as described below.
+
+For a local stdio client, use `uv run --directory /absolute/path/to/mcp-gsc python gsc_server.py`. The upstream PyPI and marketplace installation examples below do not install this fork.
+
 ## What's New
 
 ### [0.4.1] — September 2026
@@ -36,7 +59,6 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 **Property Management**
 - See all your GSC properties in one place
 - Get verification details and ownership information
-- Add or remove properties from your account
 
 **Search Analytics & Reporting**
 - Discover which queries bring visitors to your site
@@ -51,7 +73,6 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 
 **Sitemap Management**
 - View all sitemaps and their status
-- Submit new sitemaps
 - Check for errors or warnings
 
 ---
@@ -67,16 +88,19 @@ A Model Context Protocol (MCP) server that connects [Google Search Console](http
 | `get_performance_overview` | Summary of site performance | Site URL, time period |
 | `compare_search_periods` | Compare performance between two time periods | Site URL, two date ranges |
 | `get_search_by_page_query` | Search terms driving traffic to a specific page | Site URL, page URL |
-| `get_advanced_search_analytics` | Analytics with filters by country, device, query, page | Site URL |
+| `get_advanced_search_analytics` | Analytics with filters and sorting within the returned click-ranked rows | Site URL |
 | `inspect_url_enhanced` | Detailed crawl/index status for a URL | Site URL, page URL |
 | `batch_url_inspection` | Inspect up to 10 URLs at once | Site URL, list of URLs |
 | `check_indexing_issues` | Check multiple URLs for indexing problems | Site URL, list of URLs |
-| `get_sitemaps` | Lists all sitemaps for a site | Site URL |
+| `get_sitemaps` | Lists sitemaps and submitted URL counts for a site | Site URL |
 | `list_sitemaps_enhanced` | Detailed sitemap info including errors and warnings | Site URL |
-| `manage_sitemaps` | Submit or delete sitemaps | Site URL, action |
-| `reauthenticate` | Re-run the OAuth browser login (switch accounts) | Nothing |
+| `get_sitemap_details` | Read sitemap details and submitted URL counts | Site URL, sitemap URL |
+| `manage_sitemaps` | Read sitemap lists or details | Site URL, read action |
+| `get_creator_info` | Information about the upstream creator | Nothing |
 
-*Ask your AI assistant to "call get_capabilities" for the full list of all 20 tools.*
+*Ask your AI assistant to "call get_capabilities" for the full list of all 16 read-only tools.*
+
+Search Analytics returns rows ranked by clicks. `get_advanced_search_analytics` sorts only the returned rows (`sort_scope: "returned_rows"`), so sorting a 1,000-row response by impressions does not find the site's global top 1,000 by impressions. Sitemap `submitted_urls` counts URLs listed in the sitemap; it is not an indexed-page count.
 
 ---
 
@@ -330,7 +354,6 @@ If you see your properties — it's working. If not, ask: **"Call get_capabiliti
 | `GSC_CREDENTIALS_PATH` | Service account only | — | Absolute path to your service account JSON key. Always required when using `uvx`. |
 | `GSC_SKIP_OAUTH` | No | `false` | Set to `"true"` to force service account auth and skip OAuth entirely |
 | `GSC_DATA_STATE` | No | `"all"` | `"all"` matches the GSC dashboard. `"final"` returns only confirmed data (2–3 day lag). |
-| `GSC_ALLOW_DESTRUCTIVE` | No | `false` | Set to `"true"` to enable add/delete site and delete sitemap tools |
 
 ---
 
@@ -417,46 +440,70 @@ The MCP server runs locally on your machine. It only works in the **Claude Deskt
 
 ---
 
-## Safety: Destructive Operations
+## Read-only behavior
 
-By default, `add_site`, `delete_site`, and `delete_sitemap` are disabled. To enable them:
+All 16 MCP tools declare `readOnlyHint=true` and `destructiveHint=false`. Search Console writes are absent from discovery and cannot be invoked through `tools/call`, even with `GSC_ALLOW_DESTRUCTIVE=true`. `manage_sitemaps` accepts only `list` and `details`. Local Google reauthentication remains available through `python gsc_server.py --reauthenticate`.
 
-```json
-"GSC_ALLOW_DESTRUCTIVE": "true"
-```
+## Streamable HTTP
 
----
-
-## Remote Deployment & Docker (Advanced)
-
-The standard setup runs the server locally. This section is only for users who want to run it on a remote server or in a container.
-
-### HTTP Transport
+Local HTTP is available for development on loopback. It has no caller authentication, so keep it on your machine:
 
 ```bash
-MCP_TRANSPORT=sse MCP_HOST=0.0.0.0 MCP_PORT=3001 python gsc_server.py
+MCP_TRANSPORT=streamable-http uv run python gsc_server.py
 ```
+
+PowerShell:
+
+```powershell
+$env:MCP_TRANSPORT = "streamable-http"
+uv run python gsc_server.py
+```
+
+The endpoint is `http://127.0.0.1:3001/mcp`. It supports JSON-RPC `initialize`, `tools/list`, and `tools/call`, with stateless JSON responses. Clients should send `Accept: application/json, text/event-stream`. There are no `/sse` or `/messages/` routes.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_TRANSPORT` | `stdio` | Set to `sse` for network/remote use |
-| `MCP_HOST` | `127.0.0.1` | Host to bind |
-| `MCP_PORT` | `3001` | Port to bind |
+| `MCP_TRANSPORT` | `stdio` | `streamable-http` for HTTP; `http` is an alias |
+| `MCP_HOST` | `127.0.0.1` | Bind address; public binding requires the Google sign-in settings below |
+| `MCP_PORT` | `3001` | Port, between 1 and 65535 |
+| `MCP_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*,[::1]:*` | Comma-separated accepted Host values |
+| `MCP_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*,http://[::1]:*` | Comma-separated accepted Origins; requests without Origin are allowed |
 
-### Docker
+Host and Origin validation stay enabled. Do not expose local mode through a reverse proxy or tunnel. Local HTTP can refresh an existing Google connection but does not start an interactive login.
+
+### Public HTTPS for your team
+
+Public mode is designed for `https://gsc-mcp.agregated.com.au/mcp`. Every MCP client connects with its own MCP OAuth tokens, and each approved teammate signs into their **own Google account**. Search Console permissions come from that account. The server does not pass Google tokens to MCP clients or fall back to local credentials. Codex, Claude Code, and Cowork can use the same endpoint through OAuth dynamic client registration. The sign-in page shows the client name and return address before the user approves access.
+
+Create a **Google OAuth Web application** with authorized redirect URI `https://gsc-mcp.agregated.com.au/google/callback`. Enable the Search Console API. Request access for the `openid`, `email`, and `https://www.googleapis.com/auth/webmasters.readonly` scopes. Google may require app verification for production use of the Search Console scope; an app left in Testing mode may have short-lived refresh tokens. Each teammate must also have Search Console access to the properties they want to query.
+
+Set these variables on the server (for example, as private host secrets):
+
+| Variable | Value |
+|---|---|
+| `MCP_TRANSPORT` | `streamable-http` |
+| `MCP_PUBLIC_URL` | `https://gsc-mcp.agregated.com.au/mcp` |
+| `MCP_HOST` | `0.0.0.0` inside a private container network, or `127.0.0.1` behind a same-host HTTPS proxy |
+| `MCP_PORT` | `3001` unless your host needs another port |
+| `MCP_GOOGLE_CLIENT_SECRETS_FILE` | Absolute path to the Google **Web application** client JSON |
+| `MCP_ALLOWED_EMAILS` | Comma-separated Google account email addresses allowed to use the server |
+| `MCP_TOKEN_DB` | Absolute path to a persistent SQLite file in a writable directory |
+| `MCP_TOKEN_ENCRYPTION_KEY` | Stable Fernet key; generate once with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+
+Keep the Web client JSON, encryption key, and SQLite file private. Back up the key and database together; changing the key invalidates stored Google credentials and client tokens. Removing an email from `MCP_ALLOWED_EMAILS` immediately rejects that person's MCP tokens, including refresh tokens.
+
+Put an HTTPS reverse proxy in front of the server, preserve the original `Host` header, and route **all paths** (`/mcp`, `/authorize`, `/token`, `/register`, `/google/callback`, `/google/approve`, and `/.well-known/*`) to the app. Keep the app port off the public Internet; allow public access only through TLS on the named domain. Rate-limit the public OAuth endpoints, especially `/register` and `/authorize`. Do not rewrite `/mcp` to another path. Store the SQLite file on a persistent volume and run one app instance against it. The Google client JSON must contain the exact callback above. Public mode refuses to start when any required setting is absent.
+
+In Codex or Claude Code, add a remote HTTP MCP server with URL `https://gsc-mcp.agregated.com.au/mcp` and complete the browser sign-in. In a Cowork plugin, configure this as a Streamable HTTP MCP connector using OAuth with dynamic client registration. No Microsoft tenant is required. The client needs to support the standard MCP OAuth flow and PKCE. The server's protected-resource and authorization-server metadata are discoverable from the public URL.
+
+## Tests
 
 ```bash
-docker build -t mcp-gsc .
-
-docker run \
-  -e MCP_TRANSPORT=sse \
-  -e MCP_HOST=0.0.0.0 \
-  -e MCP_PORT=3001 \
-  -e GSC_CREDENTIALS_PATH=/app/credentials.json \
-  -v /path/to/credentials.json:/app/credentials.json \
-  -p 3001:3001 \
-  mcp-gsc
+uv sync --frozen --group dev
+uv run --frozen pytest -q
 ```
+
+Tests mock Google API calls. HTTP tests exercise the real ASGI endpoint, OAuth registration and token exchange, initialization, discovery, read execution, rejection of writes and legacy routes, and Host/Origin checks. Live Google accounts and Cowork are not required for this step.
 
 ---
 
@@ -532,3 +579,24 @@ MIT License. See the [LICENSE](LICENSE) file for details.
 ### [0.1.0] — Initial release
 - 19 tools covering property management, search analytics, URL inspection, and sitemap management
 - OAuth and service account authentication
+
+### API request efficiency and usage reporting
+
+The server supplies AI instructions to reuse fetched results, prefer grouped queries,
+limit date ranges and pagination, deduplicate inspection work, and stop tight retries
+on quota errors. These are guidance for the assistant, not an enforced rate limiter.
+
+Tool results include `api_usage.attempted_requests` for Search Analytics, URL
+Inspection and other calls made by that tool, including failed attempts and parallel
+batch workers. Ask the assistant to sum these across a report. Existing JSON object
+results gain an `api_usage` field; text and array results retain their original text
+with an appended JSON usage line.
+
+`remaining_property_quota` is null: Search Console exposes no live remaining-quota
+endpoint. Counts cover this tool call only, not other users, applications or server
+instances. Google processing-load consumption is unknown. No extra Google request
+is made to produce this report. Cloud Monitoring is not connected by this feature.
+
+Published property limits: Search Analytics 1,200 requests/minute; URL Inspection
+2,000/day and 600/minute. User/project and processing-load limits also apply.
+See https://developers.google.com/webmaster-tools/limits for current limits.

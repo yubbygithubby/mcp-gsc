@@ -5,13 +5,15 @@ All Google API calls are mocked — no real credentials are needed to run these 
 Run with: pytest test_gsc_server.py -v
 """
 import importlib
+import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, PropertyMock
 
 
@@ -24,7 +26,7 @@ def _load_module(env_overrides: dict | None = None):
     env = {
         "GSC_SKIP_OAUTH": "true",          # prevent live OAuth attempts by default
         "GSC_DATA_STATE": "all",
-        "GSC_ALLOW_DESTRUCTIVE": "false",
+        "MCP_TRANSPORT": "stdio",
         **(env_overrides or {}),
     }
     with patch.dict(os.environ, env, clear=False):
@@ -47,62 +49,26 @@ class TestAuth(unittest.TestCase):
         self.assertNotEqual(mod.TOKEN_FILE, os.path.join(mod.SCRIPT_DIR, "token.json"))
 
     def test_old_token_migrated_silently(self):
-        """On first run after upgrade, a token at the old SCRIPT_DIR location is moved.
+        """Exercise import-time migration from a disposable copy of the server."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_dir = os.path.join(tmpdir, "source")
+            config_dir = os.path.join(tmpdir, "config")
+            os.mkdir(script_dir)
+            source = os.path.join(script_dir, "gsc_server.py")
+            shutil.copy2(os.path.join(os.path.dirname(__file__), "gsc_server.py"), source)
+            old_token_path = os.path.join(script_dir, "token.json")
+            with open(old_token_path, "w") as token:
+                token.write('{"test": "migration_test"}')
 
-        SCRIPT_DIR is derived from __file__ at module load time, so this test places a
-        real token.json in the actual SCRIPT_DIR and re-imports with a fresh GSC_CONFIG_DIR.
-        The test cleans up after itself regardless of outcome.
-        """
-        # Discover the real SCRIPT_DIR by importing once
-        if "gsc_server" in sys.modules:
-            del sys.modules["gsc_server"]
-        with patch.dict(os.environ, {"GSC_SKIP_OAUTH": "true", "GSC_DATA_STATE": "all",
-                                     "GSC_ALLOW_DESTRUCTIVE": "false"}, clear=False):
-            import gsc_server as _tmp
-        actual_script_dir = _tmp.SCRIPT_DIR
-        del sys.modules["gsc_server"]
+            spec = importlib.util.spec_from_file_location("gsc_server_migration_test", source)
+            mod = importlib.util.module_from_spec(spec)
+            with patch.dict(os.environ, {"GSC_SKIP_OAUTH": "true", "GSC_DATA_STATE": "all",
+                                         "GSC_CONFIG_DIR": config_dir}, clear=False):
+                spec.loader.exec_module(mod)
 
-        old_token_path = os.path.join(actual_script_dir, "token.json")
-        old_token_content = '{"test": "migration_test"}'
-        preexisting_backup = None
-
-        with tempfile.TemporaryDirectory() as new_config_dir:
-            try:
-                # Back up any real existing token so we don't destroy it
-                if os.path.exists(old_token_path):
-                    preexisting_backup = old_token_path + ".test_bak"
-                    import shutil as _shutil
-                    _shutil.copy2(old_token_path, preexisting_backup)
-
-                # Place test token in old location
-                with open(old_token_path, "w") as f:
-                    f.write(old_token_content)
-
-                # Re-import with new config dir (no token there yet → migration should fire)
-                env = {
-                    "GSC_SKIP_OAUTH": "true",
-                    "GSC_DATA_STATE": "all",
-                    "GSC_ALLOW_DESTRUCTIVE": "false",
-                    "GSC_CONFIG_DIR": new_config_dir,
-                }
-                with patch.dict(os.environ, env, clear=False):
-                    import gsc_server as mod
-
-                new_token_path = os.path.join(new_config_dir, "token.json")
-                self.assertTrue(os.path.exists(new_token_path), "Token was not migrated to new location")
-                self.assertFalse(os.path.exists(old_token_path), "Old token was not removed after migration")
-                with open(new_token_path) as f:
-                    self.assertEqual(f.read(), old_token_content)
-
-            finally:
-                del sys.modules["gsc_server"]
-                # Clean up any leftover test token in SCRIPT_DIR
-                if os.path.exists(old_token_path):
-                    os.remove(old_token_path)
-                # Restore original token if it existed
-                if preexisting_backup and os.path.exists(preexisting_backup):
-                    import shutil as _shutil
-                    _shutil.move(preexisting_backup, old_token_path)
+            self.assertFalse(os.path.exists(old_token_path))
+            with open(os.path.join(config_dir, "token.json")) as token:
+                self.assertEqual(token.read(), '{"test": "migration_test"}')
 
     def test_expired_token_refresh_succeeds(self):
         """If refresh succeeds, get_gsc_service_oauth returns without error."""
@@ -215,6 +181,66 @@ class TestAuth(unittest.TestCase):
         self.assertIsNotNone(mod.GSC_CREDENTIALS_PATH)
         self.assertNotIn("~", mod.GSC_CREDENTIALS_PATH)
         self.assertTrue(mod.GSC_CREDENTIALS_PATH.startswith(os.path.expanduser("~")))
+
+    def test_oauth_failure_does_not_switch_to_service_account(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            secrets = os.path.join(tmpdir, "client_secrets.json")
+            service_key = os.path.join(tmpdir, "service_account.json")
+            for path in (secrets, service_key):
+                with open(path, "w") as file:
+                    file.write("{}")
+            mod = _load_module({
+                "GSC_SKIP_OAUTH": "false",
+                "GSC_OAUTH_CLIENT_SECRETS_FILE": secrets,
+                "GSC_CREDENTIALS_PATH": service_key,
+            })
+            with patch.object(mod, "get_gsc_service_oauth", side_effect=RuntimeError("expired")), \
+                 patch.object(mod.service_account.Credentials, "from_service_account_file") as fallback:
+                with self.assertRaisesRegex(RuntimeError, "expired"):
+                    mod.get_gsc_service()
+            fallback.assert_not_called()
+
+    def test_invalid_explicit_service_account_does_not_use_fallback_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            explicit = os.path.join(tmpdir, "explicit.json")
+            fallback = os.path.join(tmpdir, "fallback.json")
+            for path in (explicit, fallback):
+                with open(path, "w") as file:
+                    file.write("{}")
+            mod = _load_module({"GSC_SKIP_OAUTH": "true", "GSC_CREDENTIALS_PATH": explicit})
+            with patch.object(mod, "POSSIBLE_CREDENTIAL_PATHS", [explicit, fallback]), \
+                 patch.object(mod.service_account.Credentials, "from_service_account_file",
+                              side_effect=[ValueError("invalid key"), MagicMock()]) as load:
+                with self.assertRaisesRegex(ValueError, "invalid key"):
+                    mod.get_gsc_service()
+            load.assert_called_once()
+
+    def test_invalid_implicit_service_account_does_not_switch_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = os.path.join(tmpdir, "first.json")
+            second = os.path.join(tmpdir, "second.json")
+            for path in (first, second):
+                with open(path, "w") as file:
+                    file.write("{}")
+            mod = _load_module({"GSC_SKIP_OAUTH": "true"})
+            with patch.object(mod, "GSC_CREDENTIALS_PATH", None), \
+                 patch.object(mod, "POSSIBLE_CREDENTIAL_PATHS", [None, first, second]), \
+                 patch.object(mod.service_account.Credentials, "from_service_account_file",
+                              side_effect=[ValueError("invalid key"), MagicMock()]) as load:
+                with self.assertRaisesRegex(ValueError, "invalid key"):
+                    mod.get_gsc_service()
+            load.assert_called_once()
+
+    def test_unselected_credentials_path_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service_key = os.path.join(tmpdir, "service.json")
+            with open(service_key, "w") as file:
+                file.write("{}")
+            mod = _load_module({"GSC_SKIP_OAUTH": "true", "GSC_CREDENTIALS_PATH": service_key,
+                                "GSC_OAUTH_CLIENT_SECRETS_FILE": os.path.join(tmpdir, "missing.json")})
+            with patch.object(mod.service_account.Credentials, "from_service_account_file",
+                              return_value=MagicMock()), patch.object(mod, "build", return_value=MagicMock()):
+                self.assertIsNotNone(mod.get_gsc_service())
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +361,29 @@ class TestGetSearchAnalytics(unittest.IsolatedAsyncioTestCase):
             result = await mod.get_search_analytics("https://example.com/")
         self.assertIn("not found", result.lower())
 
+    async def test_days_use_inclusive_search_console_dates(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.return_value = {"rows": []}
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                instant = datetime(2026, 4, 2, 5, tzinfo=timezone.utc)
+                return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+        with patch.object(mod, "datetime", FixedDateTime), \
+             patch.object(mod, "get_gsc_service", return_value=service):
+            await mod.get_search_analytics("https://example.com/", days=28)
+
+        body = service.searchanalytics().query.call_args.kwargs["body"]
+        self.assertEqual((body["startDate"], body["endDate"]), ("2026-03-05", "2026-04-01"))
+
+    async def test_pacific_timezone_is_available(self):
+        mod = _load_module()
+        start, end = mod._date_range(28)
+        self.assertEqual((end - start).days, 27)
+
 
 # ---------------------------------------------------------------------------
 # TestGetSiteDetails
@@ -383,7 +432,8 @@ class TestGetSitemaps(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["count"], 1)
         self.assertEqual(data["sitemaps"][0]["warnings"], 1)
         self.assertEqual(data["sitemaps"][0]["status"], "Has warnings")
-        self.assertEqual(data["sitemaps"][0]["indexed_urls"], "1000")
+        self.assertEqual(data["sitemaps"][0]["submitted_urls"], "1000")
+        self.assertNotIn("indexed_urls", data["sitemaps"][0])
 
     async def test_no_sitemaps_returns_message(self):
         mod = _load_module()
@@ -697,7 +747,9 @@ class TestGetAdvancedSearchAnalytics(unittest.IsolatedAsyncioTestCase):
             result = await mod.get_advanced_search_analytics(
                 "https://example.com/", sort_by="impressions", sort_direction="descending"
             )
-        rows = json.loads(result)["rows"]
+        data = json.loads(result)
+        self.assertEqual(data["sort_scope"], "returned_rows")
+        rows = data["rows"]
         self.assertEqual([r["query"] for r in rows], ["b", "c", "a"])
 
     async def test_sort_by_position_ascending_puts_best_rank_first(self):
@@ -800,6 +852,22 @@ class TestCompareSearchPeriods(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["click_diff"], 10)
         self.assertIsNone(item["click_pct"])
         self.assertIsNone(item["imp_pct"])
+        self.assertIsNone(item["position_diff"])
+
+    async def test_lost_query_has_no_position_comparison(self):
+        mod = _load_module()
+        service = _make_service()
+        service.searchanalytics().query().execute.side_effect = [
+            {"rows": []},
+            {"rows": [{"keys": ["lost"], "clicks": 10, "impressions": 100,
+                       "ctr": 0.1, "position": 5.0}]},
+        ]
+        with patch.object(mod, "get_gsc_service", return_value=service):
+            result = await mod.compare_search_periods(
+                "https://example.com/", "2026-04-01", "2026-04-28",
+                "2026-03-01", "2026-03-28",
+            )
+        self.assertIsNone(json.loads(result)["comparison"][0]["position_diff"])
 
 
 # ---------------------------------------------------------------------------
@@ -889,58 +957,12 @@ class TestGetSitemapDetails(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# TestSafetyGuards
-# ---------------------------------------------------------------------------
-
-class TestSafetyGuards(unittest.IsolatedAsyncioTestCase):
-
-    async def test_add_site_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.add_site("https://newsite.com/")
-        self.assertIn("Safety", result)
-
-    async def test_delete_site_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.delete_site("https://newsite.com/")
-        self.assertIn("Safety", result)
-
-    async def test_delete_sitemap_blocked_by_default(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "false"})
-        result = await mod.delete_sitemap("https://example.com/", "https://example.com/sitemap.xml")
-        self.assertIn("Safety", result)
-
-    async def test_add_site_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sites().add().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.add_site("https://newsite.com/")
-        self.assertNotIn("Safety", result)
-
-    async def test_delete_site_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sites().delete().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.delete_site("https://example.com/")
-        self.assertNotIn("Safety", result)
-
-    async def test_delete_sitemap_allowed_when_flag_set(self):
-        mod = _load_module({"GSC_ALLOW_DESTRUCTIVE": "true"})
-        service = _make_service()
-        service.sitemaps().delete().execute.return_value = {}
-        with patch("gsc_server.get_gsc_service", return_value=service):
-            result = await mod.delete_sitemap("https://example.com/", "https://example.com/sitemap.xml")
-        self.assertNotIn("Safety", result)
-
-
-# ---------------------------------------------------------------------------
 # TestReauthenticate
 # ---------------------------------------------------------------------------
 
 class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
 
-    async def test_deletes_token_file(self):
+    async def test_replaces_token_after_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             token_path = os.path.join(tmpdir, "token.json")
             open(token_path, "w").write('{"old": "token"}')
@@ -961,15 +983,39 @@ class TestReauthenticate(unittest.IsolatedAsyncioTestCase):
                 result = await mod.reauthenticate()
 
             self.assertIn("Successfully authenticated", result)
-            self.assertIn("Previous session deleted", result)
-            self.assertTrue(os.path.exists(token_path))
+            with open(token_path) as token:
+                self.assertEqual(token.read(), '{"token": "new"}')
 
-    async def test_returns_error_when_no_secrets_file(self):
+    async def test_missing_secrets_preserves_existing_token(self):
         with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            with open(token_path, "w") as token:
+                token.write('{"old": "token"}')
             mod = _load_module()
-            with patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", os.path.join(tmpdir, "no_secrets.json")):
                 result = await mod.reauthenticate()
+            with open(token_path) as token:
+                self.assertEqual(token.read(), '{"old": "token"}')
         self.assertIn("Error", result)
+
+    async def test_failed_login_preserves_existing_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "token.json")
+            secrets_path = os.path.join(tmpdir, "secrets.json")
+            with open(token_path, "w") as token:
+                token.write('{"old": "token"}')
+            with open(secrets_path, "w") as secrets:
+                secrets.write("{}")
+            mod = _load_module()
+            with patch.object(mod, "TOKEN_FILE", token_path), \
+                 patch.object(mod, "OAUTH_CLIENT_SECRETS_FILE", secrets_path), \
+                 patch.object(mod.InstalledAppFlow, "from_client_secrets_file") as login:
+                login.return_value.run_local_server.side_effect = RuntimeError("cancelled")
+                result = await mod.reauthenticate()
+            self.assertIn("Error", result)
+            with open(token_path) as token:
+                self.assertEqual(token.read(), '{"old": "token"}')
 
 
 # ---------------------------------------------------------------------------
