@@ -265,11 +265,16 @@ def get_gsc_service_oauth():
     # Check if token file exists
     if os.path.exists(TOKEN_FILE):
         try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            # Load with the scopes stored in the token file (scopes=None) rather than
+            # forcing SCOPES. If the token was granted webmasters.readonly, forcing the
+            # wider write scope makes creds.refresh() request more than was granted and
+            # Google rejects it with invalid_scope (issue #56).
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE)
         except Exception as e:
-            # If token file is corrupted, delete it
-            if os.path.exists(TOKEN_FILE):
-                os.remove(TOKEN_FILE)
+            # Token file is unreadable/corrupted. Don't delete the user's file — log it
+            # and fall through to a new OAuth flow, which overwrites it on success.
+            # Silently deleting destroys data a human may want to inspect or recover.
+            logging.warning("Could not read token file %s: %s", TOKEN_FILE, e)
             creds = None
     
     # If credentials don't exist or are invalid, get new ones
@@ -1001,19 +1006,19 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
 @usage_report
 async def get_advanced_search_analytics(
     site_url: str, 
-    start_date: str = None, 
-    end_date: str = None, 
+    start_date: str | None = None,
+    end_date: str | None = None,
     dimensions: str = "query", 
     search_type: str = "WEB",
     row_limit: int = 1000,
     start_row: int = 0,
     sort_by: str = "clicks",
     sort_direction: str = "descending",
-    filter_dimension: str = None,
+    filter_dimension: str | None = None,
     filter_operator: str = "contains", 
-    filter_expression: str = None,
-    filters: str = None,
-    data_state: str = None
+    filter_expression: str | None = None,
+    filters: str | None = None,
+    data_state: str | None = None
 ) -> str:
     """
     Get advanced search analytics data with sorting, filtering, and pagination.
@@ -1065,11 +1070,12 @@ async def get_advanced_search_analytics(
         dimension_list = [d.strip() for d in dimensions.split(",")]
         
         # Build request
+        effective_row_limit = min(row_limit, 25000)
         request = {
             "startDate": start_date,
             "endDate": end_date,
             "dimensions": dimension_list,
-            "rowLimit": min(row_limit, 25000),  # Cap at API maximum
+            "rowLimit": effective_row_limit,  # Cap at API maximum
             "startRow": start_row,
             "searchType": search_type.upper(),
             "dataState": resolved_data_state
@@ -1143,7 +1149,7 @@ async def get_advanced_search_analytics(
             reverse = sort_direction.lower() != "ascending"
             rows.sort(key=lambda r: r.get(sort_by, 0), reverse=reverse)
 
-        has_more = len(response.get("rows", [])) == row_limit
+        has_more = len(response.get("rows", [])) == effective_row_limit
         return json.dumps({
             "site_url": site_url,
             "date_range": {"start": start_date, "end": end_date},
@@ -1155,7 +1161,7 @@ async def get_advanced_search_analytics(
                 "start_row": start_row,
                 "row_count": len(rows),
                 "has_more": has_more,
-                "next_start_row": start_row + row_limit if has_more else None,
+                "next_start_row": start_row + effective_row_limit if has_more else None,
             },
             "rows": rows,
         })
@@ -1403,7 +1409,7 @@ async def get_search_by_page_query(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
 @usage_report
-async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
+async def list_sitemaps_enhanced(site_url: str, sitemap_index: str | None = None) -> str:
     """
     List all sitemaps for a specific Search Console property with detailed information.
     
@@ -1530,7 +1536,7 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True,
 ))
 @usage_report
-async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
+async def manage_sitemaps(site_url: str, action: str, sitemap_url: str | None = None, sitemap_index: str | None = None) -> str:
     """
     Read sitemap lists or details without changing Search Console.
     

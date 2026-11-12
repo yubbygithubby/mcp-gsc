@@ -2,8 +2,8 @@
 
 A Model Context Protocol (MCP) server that connects [Google Search Console](https://search.google.com/search-console/about) (GSC) to AI assistants, allowing you to analyze your SEO data through natural language conversations. Works with **Claude Desktop**, **Cursor**, **Codex CLI**, **Gemini CLI**, **Antigravity**, and any other MCP-compatible client.
 
-> **Skip setup, get more.** A more advanced hosted version — one-click sign-in, added GA4 tools. Works with Claude Desktop, Claude Code, Claude.ai, Codex, Cursor, and any MCP client. Only **100 seats**.
-> → [**Advanced GSC MCP (hosted)**](https://www.advancedgsc.com/mcp?utm_source=github&utm_medium=readme&utm_campaign=mcp-gsc&utm_content=hero-callout)
+> **Skip setup, get more.** A more advanced hosted version — one-click sign-in, GA4, Google Ads, SERP lookups, keyword research, and a lot more. Works with Claude, ChatGPT, Cursor, Grok, and any other MCP client.
+> → [**Advanced MCP for SEO professionals (hosted)**](https://www.advancedgsc.com/mcp?utm_source=github&utm_medium=readme&utm_campaign=mcp-gsc&utm_content=hero-callout)
 
 ---
 
@@ -32,25 +32,14 @@ For a local stdio client, use `uv run --directory /absolute/path/to/mcp-gsc pyth
 
 ## What's New
 
-### [0.4.1] — September 2026
-- **`check_indexing_issues` runs concurrently** — same fix as #31, so it no longer times out on 10-URL batches against `sc-domain:*` properties. Thanks [@kuldiph](https://github.com/kuldiph). (#55)
-- **Removed a leftover dead `orderBy`** in `get_search_by_page_query` (the Search Analytics API ignores it). Thanks [@kuldiph](https://github.com/kuldiph). (#55)
+### [0.4.2] — November 2026
+- **Read-only OAuth tokens work again, and a failed refresh no longer deletes your token** — the server now requests only the scope it needs (read-only by default, write only when `GSC_ALLOW_DESTRUCTIVE=true`) and loads existing tokens with their granted scope, so a `webmasters.readonly` token refreshes instead of being rejected. A transient refresh failure keeps your token file instead of silently deleting it. Thanks [@christian-fastcorp](https://github.com/christian-fastcorp). (#56)
+- **Tools no longer block the event loop** — blocking Search Console API calls now run in a worker thread, so a slow request no longer stalls every other in-flight tool call. Thanks [@kuldiph](https://github.com/kuldiph). (#52)
+- **`get_advanced_search_analytics` pagination fixed when capped** — requesting more than 25,000 rows no longer drops the next page; `has_more`/`next_start_row` use the effective (capped) limit. Thanks [@dajiaohuang](https://github.com/dajiaohuang). (#62)
+- **Optional tool arguments accept an explicit `null`** — nine `str | None` parameters now validate when a client sends the advertised `null` default. Thanks [@vishalhabib99](https://github.com/vishalhabib99). (#58)
+- **Raised the `mcp[cli]` floor to `>=1.27.2`** (kept the `<2.0.0` cap) to clear four published SDK advisories. Thanks [@prateekparshwa](https://github.com/prateekparshwa). (#40)
 
-### [0.4.0] — September 2026
-- **Rich-result issues now surface** — `inspect_url_enhanced` and `batch_url_inspection` read rich-result issues from the correct API path, so markup problems are reported instead of silently dropped. Thanks [@patrickweh](https://github.com/patrickweh). (#46, #48)
-- **`batch_url_inspection` runs concurrently** — 10-URL batches no longer time out on `sc-domain:*` properties. Thanks [@remotesensei](https://github.com/remotesensei). (#31)
-- **`compare_search_periods` deltas fixed** — Period 1 is now the analyzed period and Period 2 the baseline, so growth reads as growth (not decline). Thanks [@JKdreaming](https://github.com/JKdreaming). (#42)
-- **`get_advanced_search_analytics` sorting works** — `sort_by`/`sort_direction` are now applied instead of silently ignored. Thanks [@kuldiph](https://github.com/kuldiph). (#54)
-- **Hardened error handling** — replaced bare `except:` clauses so fatal signals aren't swallowed. Thanks [@kuldiph](https://github.com/kuldiph). (#53)
-- **Note:** `batch_url_inspection` renames the per-URL `verdict` field to `index_verdict` to distinguish it from the rich-result verdict.
-
-### [0.3.3] — July 2026
-- **Fixed fresh installs broken by `mcp` 2.0** — pinned `mcp[cli]<2.0.0`. The `mcp` SDK 2.0.0 (released 2026-07-28) removed the `mcp.server.fastmcp` module, so every fresh `uvx mcp-search-console` install crashed on startup with `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`. New installs now resolve a working 1.x SDK again — no `--with "mcp<2"` workaround needed.
-
-### [0.3.2] — April 2026
-- **OAuth browser flow fixed for uvx** — removed the `isatty` block that prevented the browser login window from opening when running as an MCP subprocess on macOS. OAuth now works out of the box with `uvx`, no manual terminal run needed.
-- **`get_capabilities` tool added** — call this to get a full list of available tools and current auth status in one shot. Useful when your AI assistant isn't sure what tools are available.
-- **Better auth error messages** — all tools now tell you exactly what to do when credentials are missing or expired.
+See the full version history in the [Changelog](#changelog) below.
 
 ---
 
@@ -530,6 +519,13 @@ MIT License. See the [LICENSE](LICENSE) file for details.
 ---
 
 ## Changelog
+
+### [0.4.2] — November 2026
+- Fixed OAuth for read-only tokens: the server now requests only the scope the enabled tools need (`webmasters.readonly` by default, the write scope only when `GSC_ALLOW_DESTRUCTIVE=true`) and loads an existing token with its granted scope, so a `webmasters.readonly` token refreshes instead of failing with `invalid_scope`. A failed refresh (or an unreadable token file) no longer deletes the token file — a transient error must not destroy a working credential. (Fixes #56; thanks [@christian-fastcorp](https://github.com/christian-fastcorp))
+- Blocking `google-api-python-client` calls now run off the event loop via a worker thread (`_execute`), so a slow request no longer stalls other concurrent tool calls. (Fixes #52; thanks [@kuldiph](https://github.com/kuldiph))
+- Fixed `get_advanced_search_analytics` pagination when `row_limit` exceeds the API cap of 25,000: `has_more` and `next_start_row` now use the effective capped limit instead of the requested one, so the next page is no longer dropped. (Fixes #62; thanks [@dajiaohuang](https://github.com/dajiaohuang))
+- Optional tool arguments annotated `str | None = None` now accept an explicit `null` from clients that send the advertised default, instead of failing argument validation. (Fixes #58; thanks [@vishalhabib99](https://github.com/vishalhabib99))
+- Raised the `mcp[cli]` dependency floor to `>=1.27.2` (keeping the `<2.0.0` cap from 0.3.3) to clear four published MCP SDK advisories. (Fixes #40; thanks [@prateekparshwa](https://github.com/prateekparshwa))
 
 ### [0.4.1] — September 2026
 - `check_indexing_issues` now inspects URLs concurrently (same fix as #31), avoiding timeouts on full 10-URL batches against `sc-domain:*` properties. (Fixes #55; thanks [@kuldiph](https://github.com/kuldiph))
