@@ -1,5 +1,6 @@
 """Google sign-in and per-user credentials for the public MCP transport."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from urllib.parse import urlencode
 
 import requests
 from cryptography.fernet import Fernet
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
 from google.oauth2.credentials import Credentials
@@ -182,8 +184,10 @@ class GoogleAuthProvider:
             "token": tokens["access_token"], "refresh_token": refresh,
             "expiry": time.time() + int(tokens.get("expires_in", 3600)),
         }
+        grant = secrets.token_urlsafe(32)
         self._put("google", subject, {
             "email": email, "credentials": self.fernet.encrypt(json.dumps(google_creds).encode()).decode(),
+            "grant": grant,
         })
         auth_code = secrets.token_urlsafe(32)
         code_record = AuthorizationCode(
@@ -193,7 +197,9 @@ class GoogleAuthProvider:
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=self.public_url, subject=subject,
         )
-        self._put("code", _digest(auth_code), code_record.model_dump(mode="json"), code_record.expires_at)
+        code_value = code_record.model_dump(mode="json")
+        code_value["grant"] = grant
+        self._put("code", _digest(auth_code), code_value, code_record.expires_at)
         return RedirectResponse(
             construct_redirect_uri(str(params.redirect_uri), code=auth_code, state=params.state),
             status_code=302, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
@@ -203,17 +209,23 @@ class GoogleAuthProvider:
         value = self._get("code", _digest(authorization_code))
         return AuthorizationCode.model_validate(value) if value and value["client_id"] == client.client_id else None
 
-    def _issue(self, client_id, subject, scopes):
+    def _issue(self, client_id, subject, scopes, expected_grant=...):
+        user = self._get("google", subject)
+        if not user or user["email"] not in self.allowed_emails or (expected_grant is not ... and expected_grant != user.get("grant")):
+            raise TokenError("invalid_grant", "Account is no longer allowed")
         access, refresh = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         now = time.time()
-        self._put("access", _digest(access), AccessToken(
+        access_record = AccessToken(
             token=access, client_id=client_id, scopes=scopes, expires_at=int(now + 3600),
             resource=self.public_url, subject=subject,
-        ).model_dump(mode="json"), now + 3600)
-        self._put("refresh", _digest(refresh), RefreshToken(
+        ).model_dump(mode="json")
+        refresh_record = RefreshToken(
             token=refresh, client_id=client_id, scopes=scopes, expires_at=int(now + 30 * 86400),
             subject=subject,
-        ).model_dump(mode="json"), now + 30 * 86400)
+        ).model_dump(mode="json")
+        access_record["grant"] = refresh_record["grant"] = user.get("grant")
+        self._put("access", _digest(access), access_record, now + 3600)
+        self._put("refresh", _digest(refresh), refresh_record, now + 30 * 86400)
         pair = {"access": _digest(access), "refresh": _digest(refresh)}
         self._put("pair", pair["access"], pair, now + 30 * 86400)
         self._put("pair", pair["refresh"], pair, now + 30 * 86400)
@@ -223,28 +235,43 @@ class GoogleAuthProvider:
         value = self._take("code", _digest(authorization_code.code))
         if not value or value["client_id"] != client.client_id:
             raise TokenError("invalid_grant", "Authorization code was already used")
-        return self._issue(client.client_id, value["subject"], value["scopes"])
+        return self._issue(client.client_id, value["subject"], value["scopes"], value.get("grant"))
 
     async def load_refresh_token(self, client, refresh_token):
         value = self._get("refresh", _digest(refresh_token))
-        return RefreshToken.model_validate(value) if value and value["client_id"] == client.client_id else None
+        return RefreshToken.model_validate(value) if value and value["client_id"] == client.client_id and self._grant_allowed(value) else None
 
     async def exchange_refresh_token(self, client, refresh_token, scopes):
         value = self._take("refresh", _digest(refresh_token.token))
         if not value or value["client_id"] != client.client_id:
             raise TokenError("invalid_grant", "Refresh token was already used")
-        if not self._allowed(value["subject"]):
+        if not self._grant_allowed(value):
             raise TokenError("invalid_grant", "Account is no longer allowed")
         self._revoke_pair(_digest(refresh_token.token))
-        return self._issue(client.client_id, value["subject"], scopes)
+        return self._issue(client.client_id, value["subject"], scopes, value.get("grant"))
 
     def _allowed(self, subject):
         user = self._get("google", subject)
         return bool(user and user["email"] in self.allowed_emails)
 
+    def _grant_allowed(self, token):
+        user = self._get("google", token["subject"])
+        return bool(user and user["email"] in self.allowed_emails and
+                    token.get("grant") == user.get("grant"))
+
     async def load_access_token(self, token):
         value = self._get("access", _digest(token))
-        return AccessToken.model_validate(value) if value and self._allowed(value["subject"]) and value["resource"] == self.public_url else None
+        if not value or value["resource"] != self.public_url or not self._grant_allowed(value):
+            return None
+        try:
+            await asyncio.to_thread(self._google_credentials, value["subject"])
+        except PermissionError:
+            return None
+        except RefreshError:
+            if not self._allowed(value["subject"]):
+                return None
+            raise
+        return AccessToken.model_validate(value) if self._grant_allowed(value) else None
 
     async def revoke_token(self, token):
         self._revoke_pair(_digest(token.token))
@@ -256,7 +283,22 @@ class GoogleAuthProvider:
                 self._delete(kind, pair[kind])
                 self._delete("pair", pair[kind])
 
-    def get_service(self, subject):
+    def _replace_google_if_current(self, subject, user, replacement):
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM records WHERE kind='google' AND key=?", (subject,)).fetchone()
+            current = json.loads(self.fernet.decrypt(row[0])) if row else None
+            if not current or current["credentials"] != user["credentials"]:
+                return False
+            if replacement is None:
+                db.execute("DELETE FROM records WHERE kind='google' AND key=?", (subject,))
+            else:
+                db.execute("UPDATE records SET value=? WHERE kind='google' AND key=?", (
+                    self.fernet.encrypt(json.dumps(replacement).encode()), subject,
+                ))
+            return True
+
+    def _google_credentials(self, subject):
         user = self._get("google", subject)
         if not user or user["email"] not in self.allowed_emails:
             raise PermissionError("This Google account is no longer allowed")
@@ -267,10 +309,22 @@ class GoogleAuthProvider:
             client_secret=self.google_client_secret, scopes=[GOOGLE_SCOPE],
         )
         if saved["expiry"] < time.time() + 60:
-            creds.refresh(GoogleRequest())
+            try:
+                creds.refresh(GoogleRequest())
+            except RefreshError as exc:
+                if any(isinstance(arg, dict) and arg.get("error") == "invalid_grant" for arg in exc.args):
+                    if not self._replace_google_if_current(subject, user, None) and self._get("google", subject):
+                        return self._google_credentials(subject)
+                raise
             saved.update(token=creds.token, expiry=creds.expiry.timestamp())
-            self._put("google", subject, {
+            replacement = {
                 "email": user["email"],
                 "credentials": self.fernet.encrypt(json.dumps(saved).encode()).decode(),
-            })
-        return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+                "grant": user.get("grant"),
+            }
+            if not self._replace_google_if_current(subject, user, replacement):
+                return self._google_credentials(subject)
+        return creds
+
+    def get_service(self, subject):
+        return build("searchconsole", "v1", credentials=self._google_credentials(subject), cache_discovery=False)
